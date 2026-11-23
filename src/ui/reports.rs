@@ -148,7 +148,16 @@ fn websites(s: &State, compact: bool) -> El {
     let previous: i64 = domains.iter().map(|site| site.previous).sum();
     let mut card = panel()
         .key("report-websites")
-        .child(heading("Websites by domain", 2));
+        .child(heading("Websites by domain", 2))
+        .child(
+            search_field(
+                "report-website-search",
+                "Search domains",
+                &s.report_website_search,
+                |s| &mut s.report_website_search,
+            )
+            .max_w(412.0),
+        );
     if domains.is_empty() {
         return card.child(label("No website time recorded for these dates. New Chrome and Firefox activity will appear here when a domain is available.", BODY, color(MUTED)).wrap());
     }
@@ -169,6 +178,13 @@ fn websites(s: &State, compact: bool) -> El {
                 color(MUTED),
             )),
     );
+    let query = search_query(&s.report_website_search);
+    let matching = domains
+        .iter()
+        .filter(|site| site.domain.to_lowercase().contains(&query));
+    if matching.clone().next().is_none() {
+        return card.child(empty_message("No matching domains."));
+    }
     if !compact {
         card = card.child(
             row()
@@ -179,7 +195,7 @@ fn websites(s: &State, compact: bool) -> El {
                 .child(label("TOTAL / CHANGE", LABEL, color(MUTED)).w(190.0)),
         );
     }
-    for site in domains {
+    for site in matching {
         let time = format!(
             "{}  ({})",
             duration(site.total()),
@@ -388,9 +404,25 @@ fn apps(s: &State, compact: bool) -> El {
             |s, _| s.report_group = None,
         ));
     }
-    let mut card = panel().key("report-apps").child(header);
+    let mut card = panel().key("report-apps").child(header).child(
+        search_field(
+            "report-app-search",
+            "Search report apps",
+            &s.report_app_search,
+            |s| &mut s.report_app_search,
+        )
+        .max_w(412.0),
+    );
     if s.report.apps.is_empty() {
         return card.child(label("No app activity to compare.", BODY, color(MUTED)).wrap());
+    }
+    let query = search_query(&s.report_app_search);
+    let matching = s.report.apps.iter().filter(|usage| {
+        selected.is_none_or(|group| report::group_key(&usage.app) == group.key)
+            && usage.app.matches(&query)
+    });
+    if matching.clone().next().is_none() {
+        return card.child(empty_message("No matching apps."));
     }
     if !compact {
         card = card.child(
@@ -401,10 +433,7 @@ fn apps(s: &State, compact: bool) -> El {
                 .child(label("SESSIONS / CHANGE", LABEL, color(MUTED)).w(160.0)),
         );
     }
-    for usage in &s.report.apps {
-        if selected.is_some_and(|group| report::group_key(&usage.app) != group.key) {
-            continue;
-        }
+    for usage in matching {
         let time = format!(
             "{}  ({})",
             duration(usage.current.time),

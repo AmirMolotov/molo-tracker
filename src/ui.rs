@@ -3,7 +3,9 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use chrono::{Datelike, Days, Local, TimeZone};
 use rune::tok::motion;
-use rune::{Color, Cx, El, ScrollSpec, TextStyle, Transition, Tx, col, el, row, text, text_input};
+use rune::{
+    Color, Cx, El, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el, row, text, text_input,
+};
 
 use crate::store::Session;
 use crate::{Screen, State};
@@ -106,6 +108,91 @@ fn separator() -> El {
     el().w_full().h(1.0).fill(color(LINE))
 }
 
+fn search_field(
+    key: &str,
+    hint: &str,
+    edit: &TextEdit,
+    access: fn(&mut State) -> &mut TextEdit,
+) -> El {
+    let gold = color(0xdabb84);
+    let field = key.to_owned();
+    let mut bar = row()
+        .w_full()
+        .min_w(0.0)
+        .h(44.0)
+        .radius(7.0)
+        .center_y()
+        .gap(10.0)
+        .fill(color(0x252c28))
+        .border(1.0, color(0x54594a))
+        .focus_within_ring(2.0, 1.0, gold)
+        .child(
+            el().size(34.0, 34.0)
+                .ml(4.0)
+                .radius(4.0)
+                .fill(color(0x383f36))
+                .center()
+                .child(
+                    el().size(17.0, 17.0).a11y_hidden().shape(
+                        rune::Shape::new()
+                            .stroke(
+                                (0..=24)
+                                    .map(|i| {
+                                        let angle = std::f32::consts::TAU * i as f32 / 24.0;
+                                        [7.0 + 4.4 * angle.cos(), 7.0 + 4.4 * angle.sin()]
+                                    })
+                                    .collect::<Vec<_>>(),
+                                1.6,
+                                gold,
+                            )
+                            .line([10.4, 10.4], [15.0, 15.0], 1.6, rune::LineCap::Round, gold)
+                            .view_box(17.0, 17.0),
+                    ),
+                ),
+        )
+        .child(
+            text_input(edit, BODY)
+                .key(key)
+                .label(hint)
+                .min_w(0.0)
+                .grow(1.0)
+                .color(color(PAPER))
+                .placeholder(hint, color(0xbfc6b9))
+                .caret(gold, color(0x58614d))
+                .on_edit(access),
+        );
+    if !edit.text.is_empty() {
+        bar = bar.child(
+            row()
+                .key(format!("{key}-clear"))
+                .size(44.0, 44.0)
+                .center()
+                .role("button")
+                .label("Clear search")
+                .focusable(true)
+                .focus_ring(2.0, -3.0, gold)
+                .radius(6.0)
+                .hover(color(0x464e42))
+                .on_press_tx(move |s: &mut State, tx| {
+                    *access(s) = TextEdit::new("");
+                    tx.focus(&field, true);
+                })
+                .child(label("×", TextStyle::new(19.0, 500.0), gold)),
+        );
+    } else {
+        bar = bar.child(el().w(11.0));
+    }
+    bar
+}
+
+fn search_query(edit: &TextEdit) -> String {
+    edit.text.trim().to_lowercase()
+}
+
+fn empty_message(message: &str) -> El {
+    label(message, BODY, color(MUTED)).wrap()
+}
+
 fn app_color(key: &str) -> Color {
     let colors = [0x315f49, 0x606f32, 0x3f7078, 0x926344, 0x73594d, 0x546b52];
     let mut hash = DefaultHasher::new();
@@ -146,11 +233,15 @@ fn activity(s: &State, compact: bool) -> El {
     for session in &s.sessions {
         let total = by_app
             .entry(session.app.id.key.as_str())
-            .or_insert((session.app.label(), 0));
+            .or_insert((&session.app, 0));
         total.1 += session.end - session.start;
     }
     let mut apps: Vec<_> = by_app.into_iter().collect();
-    apps.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.1.0.cmp(b.1.0)));
+    apps.sort_by(|a, b| {
+        b.1.1
+            .cmp(&a.1.1)
+            .then_with(|| a.1.0.label().cmp(b.1.0.label()))
+    });
     let total = apps.iter().map(|(_, (_, ms))| ms).sum();
     let maximum = apps.first().map_or(1, |(_, (_, ms))| *ms);
 
@@ -228,8 +319,11 @@ fn activity(s: &State, compact: bool) -> El {
             .wrap(),
         );
 
+    let query = search_query(&s.chart_search);
+    let matched = apps.into_iter().filter(|(_, (app, _))| app.matches(&query));
+    let has_match = matched.clone().next().is_some();
     let mut bars = col().key("bar-list").w_full().gap(11.0);
-    for (key, (name, ms)) in apps {
+    for (key, (app, ms)) in matched {
         let ratio = (ms as f64 / maximum as f64) as f32;
         bars = bars.child(
             col()
@@ -243,7 +337,7 @@ fn activity(s: &State, compact: bool) -> El {
                         .center_y()
                         .child(app_mark(s, key))
                         .child(
-                            label(name, BODY, color(INK))
+                            label(app.label(), BODY, color(INK))
                                 .min_w(0.0)
                                 .grow(1.0)
                                 .truncate(),
@@ -266,6 +360,12 @@ fn activity(s: &State, compact: bool) -> El {
         .key("usage-chart")
         .grow(1.45)
         .child(heading("Usage by app", 2))
+        .child(search_field(
+            "chart-search",
+            "Search apps",
+            &s.chart_search,
+            |s| &mut s.chart_search,
+        ))
         .child(if s.sessions.is_empty() {
             col().h(118.0).gap(12.0).child(separator()).child(
                 label(
@@ -275,6 +375,8 @@ fn activity(s: &State, compact: bool) -> El {
                 )
                 .wrap(),
             )
+        } else if !has_match {
+            col().h(118.0).child(empty_message("No matching apps."))
         } else {
             col()
                 .key("chart-scroll")
@@ -417,12 +519,19 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
         );
     }
     if s.visible_apps().next().is_none() {
-        entries = entries.child(label("No apps in this folder.", BODY, color(MUTED)).wrap());
+        entries = entries.child(empty_message(
+            if search_query(&s.folder_search).is_empty() {
+                "No apps in this folder."
+            } else {
+                "No matching apps in this folder."
+            },
+        ));
     }
     let list = panel().key("app-list").grow(1.0)
         .child(heading("App aliases and groups", 2))
         .child(label("Ctrl-click to toggle apps or Shift-click to select a range. Drop selected apps on a folder.", BODY, color(MUTED)).wrap())
         .child(folders)
+        .child(search_field("folder-search", "Search apps in this folder", &s.folder_search, |s| &mut s.folder_search))
         .child(col().key("folder-apps").w_full().h(if compact { 210.0 } else { 298.0 })
             .scroll(ScrollSpec { stick_bottom: false }).child(entries));
 
@@ -462,6 +571,20 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
             BODY,
             color(MUTED),
         ));
+    }
+    let hidden = s.selection.len()
+        - s.visible_apps()
+            .filter(|app| s.selection.contains(&app.id.key))
+            .count();
+    if hidden > 0 {
+        editor = editor.child(
+            label(
+                format!("{} selected outside this search", crate::app_count(hidden)),
+                BODY,
+                color(MUTED),
+            )
+            .wrap(),
+        );
     }
     let action = if s.selection.is_empty() {
         "Create folder"
@@ -668,7 +791,17 @@ fn timetable(s: &State, compact: bool) -> El {
     let mut log = panel()
         .key("timetable")
         .w_full()
-        .child(heading("Timetable", 2));
+        .child(heading("Timetable", 2))
+        .child(
+            search_field(
+                "timetable-search",
+                "Search apps, pages, or times",
+                &s.timetable_search,
+                State::edit_timetable_search,
+            )
+            .max_w(412.0),
+        );
+    let query = search_query(&s.timetable_search);
     let visible = s
         .sessions
         .iter()
@@ -683,6 +816,31 @@ fn timetable(s: &State, compact: bool) -> El {
             .child(separator())
             .child(label(message, BODY, color(MUTED)).wrap());
     }
+    let matched: Vec<_> = visible
+        .filter_map(|session| {
+            if session.app.matches(&query)
+                || time(session.start).contains(&query)
+                || time(session.end).contains(&query)
+                || duration(session.end - session.start).contains(&query)
+            {
+                return Some((session, Vec::new()));
+            }
+            let titles: Vec<_> = s
+                .timetable_titles
+                .as_ref()
+                .and_then(|titles| titles.get(&session.id))
+                .into_iter()
+                .flatten()
+                .filter(|title| title.to_lowercase().contains(&query))
+                .collect();
+            (!titles.is_empty()).then_some((session, titles))
+        })
+        .collect();
+    if matched.is_empty() {
+        return log
+            .child(separator())
+            .child(empty_message("No matching sessions."));
+    }
     if !compact {
         log = log.child(
             row()
@@ -693,15 +851,15 @@ fn timetable(s: &State, compact: bool) -> El {
                 .child(label("DURATION", LABEL, color(MUTED)).w(68.0)),
         );
     }
-    for session in visible {
+    for (session, titles) in matched {
         log = log
             .child(separator())
-            .child(session_row(s, session, compact));
+            .child(session_row(s, session, &titles, compact));
     }
     log
 }
 
-fn session_row(s: &State, session: &Session, compact: bool) -> El {
+fn session_row(s: &State, session: &Session, matching_titles: &[&String], compact: bool) -> El {
     let id = session.id;
     let browser = session.app.id.browser_brand().is_some();
     let expanded = browser && s.expanded == Some(id);
@@ -795,6 +953,22 @@ fn session_row(s: &State, session: &Session, compact: bool) -> El {
                         TIME,
                         color(MUTED),
                     )),
+            );
+        }
+    } else if !matching_titles.is_empty() {
+        group = group.child(
+            label(matching_titles[0], BODY, color(MUTED))
+                .px(16.0)
+                .truncate(),
+        );
+        if matching_titles.len() > 1 {
+            group = group.child(
+                label(
+                    format!("{} more matching pages", matching_titles.len() - 1),
+                    LABEL,
+                    color(MUTED),
+                )
+                .px(16.0),
             );
         }
     }

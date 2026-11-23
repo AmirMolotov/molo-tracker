@@ -57,12 +57,16 @@ struct State {
     icons: Option<ImageCache>,
     app_icons: RefCell<HashMap<String, Image>>,
     sessions: Vec<Session>,
+    chart_search: TextEdit,
+    timetable_search: TextEdit,
+    timetable_titles: Option<BTreeMap<i64, Vec<String>>>,
     prior_total: i64,
     month: NaiveDate,
     month_totals: [i64; 31],
     expanded: Option<i64>,
     pages: Vec<BrowserPage>,
     apps: Vec<Application>,
+    folder_search: TextEdit,
     screen: Screen,
     cutoff: u32,
     cutoff_input: TextEdit,
@@ -80,6 +84,8 @@ struct State {
     report: Report,
     report_group: Option<String>,
     report_websites: bool,
+    report_app_search: TextEdit,
+    report_website_search: TextEdit,
     notice: Option<String>,
     tracking_error: Option<String>,
 }
@@ -111,12 +117,16 @@ impl State {
             icons: None,
             app_icons: RefCell::default(),
             sessions: Vec::new(),
+            chart_search: TextEdit::new(""),
+            timetable_search: TextEdit::new(""),
+            timetable_titles: None,
             prior_total: 0,
             month: today.with_day(1).unwrap(),
             month_totals: [0; 31],
             expanded: None,
             pages: Vec::new(),
             apps: Vec::new(),
+            folder_search: TextEdit::new(""),
             screen: Screen::Activity,
             cutoff,
             cutoff_input: TextEdit::new(cutoff.to_string()),
@@ -134,6 +144,8 @@ impl State {
             report: Report::default(),
             report_group: None,
             report_websites: false,
+            report_app_search: TextEdit::new(""),
+            report_website_search: TextEdit::new(""),
             notice: None,
             tracking_error: None,
         };
@@ -159,6 +171,10 @@ impl State {
             }
         }
         self.refresh_pages();
+        self.timetable_titles = None;
+        if self.screen == Screen::Activity && !self.timetable_search.text.trim().is_empty() {
+            self.load_timetable_titles();
+        }
         if self.screen == Screen::Reports {
             self.refresh_report();
         }
@@ -174,6 +190,28 @@ impl State {
                 }
             }
         }
+    }
+
+    fn load_timetable_titles(&mut self) {
+        match self.store.page_titles(self.day) {
+            Ok(pages) => {
+                let mut titles = BTreeMap::<_, Vec<_>>::new();
+                for (id, title) in pages {
+                    titles.entry(id).or_default().push(title);
+                }
+                self.timetable_titles = Some(titles);
+            }
+            Err(error) => {
+                self.notice = Some(format!("Could not search browser page titles. {error}"))
+            }
+        }
+    }
+
+    fn edit_timetable_search(&mut self) -> &mut TextEdit {
+        if self.timetable_titles.is_none() {
+            self.load_timetable_titles();
+        }
+        &mut self.timetable_search
     }
 
     fn select_day(&mut self, day: NaiveDate) {
@@ -302,10 +340,12 @@ impl State {
     }
 
     fn visible_apps(&self) -> impl Iterator<Item = &Application> {
-        self.apps.iter().filter(|app| {
+        let search = self.folder_search.text.trim().to_lowercase();
+        self.apps.iter().filter(move |app| {
             self.folder
                 .as_ref()
                 .is_none_or(|folder| report::group_key(app) == *folder)
+                && app.matches(&search)
         })
     }
 

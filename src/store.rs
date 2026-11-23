@@ -21,6 +21,16 @@ impl Application {
     pub fn label(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.id.name)
     }
+
+    pub fn matches(&self, query: &str) -> bool {
+        query.is_empty()
+            || self.label().to_lowercase().contains(query)
+            || self.id.name.to_lowercase().contains(query)
+            || self
+                .group
+                .as_deref()
+                .is_some_and(|name| name.to_lowercase().contains(query))
+    }
 }
 
 pub struct Session {
@@ -292,6 +302,22 @@ impl Store {
                     end: row.get(2)?,
                 })
             })?
+            .collect()
+    }
+
+    pub fn page_titles(&self, day: NaiveDate) -> rusqlite::Result<Vec<(i64, String)>> {
+        let Some((start, end)) = day_bounds(day) else {
+            return Ok(Vec::new());
+        };
+        let mut query = self.0.prepare(
+            "SELECT DISTINCT sessions.id, chrome_pages.title
+             FROM sessions JOIN chrome_pages ON chrome_pages.session_id = sessions.id
+             WHERE sessions.end > ?1 AND sessions.start < ?2
+               AND chrome_pages.end > ?1 AND chrome_pages.start < ?2
+             ORDER BY sessions.id, chrome_pages.title",
+        )?;
+        query
+            .query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect()
     }
 

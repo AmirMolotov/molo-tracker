@@ -16,6 +16,8 @@ Close the window to keep recording in the tray. Click the Molo icon in the Windo
 
 **Activity** shows the selected day’s focus time, how it compares with the previous day, a chart by app, and a timetable of sessions. **Calendar** shows daily totals in a monthly grid. Select a date to open its activity.
 
+Search is available in the app chart, timetable, Settings app folders, report app breakdown, and website reports. App names and aliases match without regard to case. The timetable can also find recorded page titles and displayed times.
+
 Chrome and Firefox sessions start collapsed in the timetable. Expand a session to see the focused tab titles and how long each title was visible. Molo reads the active browser window title and stores it locally. Earlier sessions can only show page titles if Molo recorded them at the time.
 
 In **Settings**, **Timetable cutoff** starts at 5 seconds. Shorter sessions remain in daily totals and the usage chart. Set the cutoff to 0 to show all sessions. Select one app under **App aliases and groups** to rename it in the chart and timetable. Save a blank alias to restore the original name.
