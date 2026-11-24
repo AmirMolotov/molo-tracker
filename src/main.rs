@@ -3,6 +3,7 @@
 mod platform;
 mod report;
 mod store;
+mod sync;
 mod ui;
 mod websites;
 
@@ -19,12 +20,77 @@ use report::{Period, Report};
 use rune::{
     App, AppSpec, Image, ImageCache, TextEdit, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec, Tx,
 };
-use store::{Application, BrowserPage, Session, Store};
+use store::{Application, BrowserPage, DEFAULT_IDLE_SECONDS, Session, Store};
 use websites::WebsiteProbe;
 
 struct Sample {
     app: Option<FocusedApp>,
     time: i64,
+    idle_at: Option<i64>,
+    idle_exempt: bool,
+}
+
+impl Sample {
+    fn active_end(&self, current: &Self, last_input: Option<i64>) -> Option<i64> {
+        let now = current.time;
+        // Input before the previous deadline extends the active interval without a gap.
+        let end = match (self.idle_exempt, self.idle_at) {
+            (true, _) => now,
+            (false, Some(deadline))
+                if !last_input.is_some_and(|input| self.time < input && input <= deadline) =>
+            {
+                now.min(deadline)
+            }
+            _ => now.min(current.idle_at.unwrap_or(now)),
+        };
+        ((1..=2500).contains(&(now - self.time)) && end > self.time).then_some(end)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn idle_deadline_clips_the_last_recorded_interval() {
+    let previous = Sample {
+        app: None,
+        time: 1000,
+        idle_at: Some(1400),
+        idle_exempt: false,
+    };
+    let current = Sample {
+        app: None,
+        time: 2050,
+        idle_at: Some(1400),
+        idle_exempt: true,
+    };
+    assert_eq!(previous.active_end(&current, Some(400)), Some(1400));
+    let exempt = Sample {
+        idle_exempt: true,
+        ..previous
+    };
+    let regular = Sample {
+        idle_exempt: false,
+        ..current
+    };
+    assert_eq!(exempt.active_end(&regular, Some(400)), Some(2050));
+    let previous = Sample {
+        idle_exempt: false,
+        ..exempt
+    };
+    let resumed = Sample {
+        idle_at: Some(2900),
+        ..regular
+    };
+    assert_eq!(previous.active_end(&resumed, Some(1900)), Some(1400));
+    let extended = Sample {
+        idle_at: Some(2300),
+        ..resumed
+    };
+    assert_eq!(previous.active_end(&extended, Some(1300)), Some(2050));
+    let gap = Sample {
+        time: 5000,
+        ..extended
+    };
+    assert_eq!(previous.active_end(&gap, Some(1300)), None);
 }
 
 struct DragPreview {
@@ -41,10 +107,26 @@ enum Screen {
     Settings,
 }
 
+#[derive(Clone, Copy)]
+enum GroupEdit {
+    Rename,
+    Delete,
+}
+
 struct State {
     store: Store,
+    sync: Option<sync::Client>,
+    sync_error: Option<String>,
     live: bool,
     paused: bool,
+    idle: bool,
+    idle_seconds: u32,
+    idle_input: TextEdit,
+    idle_notice: Option<String>,
+    idle_exceptions: BTreeSet<String>,
+    idle_exceptions_open: bool,
+    idle_exception_search: TextEdit,
+    idle_exception_error: Option<String>,
     today: NaiveDate,
     day: NaiveDate,
     first: NaiveDate,
@@ -76,6 +158,9 @@ struct State {
     selection_anchor: Option<String>,
     folders: BTreeMap<String, String>,
     folder: Option<String>,
+    folder_name: TextEdit,
+    folder_notice: Option<String>,
+    group_edit: Option<GroupEdit>,
     drag_preview: Option<DragPreview>,
     alias: TextEdit,
     group_input: TextEdit,
@@ -97,13 +182,37 @@ impl State {
             Ok(seconds) => (seconds, None),
             Err(error) => (5, Some(format!("Could not read the cutoff. {error}"))),
         };
+        let (idle_seconds, idle_notice) = match store.idle_seconds() {
+            Ok(seconds) => (seconds, None),
+            Err(error) => (
+                DEFAULT_IDLE_SECONDS,
+                Some(format!("Could not read the idle timeout. {error}")),
+            ),
+        };
+        let (idle_exceptions, idle_exception_error) = match store.idle_exceptions() {
+            Ok(exceptions) => (exceptions, None),
+            Err(error) => (
+                BTreeSet::new(),
+                Some(format!("Could not read idle exceptions. {error}")),
+            ),
+        };
         let mut state = Self {
             store,
+            sync: None,
+            sync_error: None,
             live,
             today,
             day: today,
             first: today,
             paused: false,
+            idle: false,
+            idle_seconds,
+            idle_input: TextEdit::new(idle_seconds.to_string()),
+            idle_notice,
+            idle_exceptions,
+            idle_exceptions_open: false,
+            idle_exception_search: TextEdit::new(""),
+            idle_exception_error,
             sample: None,
             website_probe: if live {
                 WebsiteProbe::start().ok()
@@ -136,6 +245,9 @@ impl State {
             selection_anchor: None,
             folders: BTreeMap::new(),
             folder: None,
+            folder_name: TextEdit::new(""),
+            folder_notice: None,
+            group_edit: None,
             drag_preview: None,
             alias: TextEdit::new(""),
             group_input: TextEdit::new(""),
@@ -180,6 +292,25 @@ impl State {
         }
     }
 
+    fn login_sync(&mut self) {
+        if self.live
+            && let Some(sync) = &mut self.sync
+        {
+            sync.login(&self.store);
+        }
+    }
+
+    fn logout_sync(&mut self) {
+        if self
+            .sync
+            .as_mut()
+            .is_some_and(|sync| sync.logout(&mut self.store))
+        {
+            self.refresh();
+            self.refresh_apps();
+        }
+    }
+
     fn refresh_pages(&mut self) {
         self.pages.clear();
         if let Some(session) = self.sessions.iter().find(|s| Some(s.id) == self.expanded) {
@@ -221,6 +352,12 @@ impl State {
     }
 
     fn show_screen(&mut self, screen: Screen) {
+        if self.screen == Screen::Settings
+            && screen != Screen::Settings
+            && let Some(sync) = &mut self.sync
+        {
+            sync.clear_password();
+        }
         self.screen = screen;
         self.notice = None;
         match screen {
@@ -305,6 +442,30 @@ impl State {
         }
     }
 
+    fn save_idle(&mut self) {
+        let Ok(seconds) = self.idle_input.text.trim().parse::<u32>() else {
+            self.idle_notice = Some("Enter a nonnegative whole number of seconds.".into());
+            return;
+        };
+        if seconds.checked_mul(1000).is_none() {
+            self.idle_notice = Some(format!("Enter at most {} seconds.", u32::MAX / 1000));
+            return;
+        }
+        match self.store.save_idle_seconds(seconds) {
+            Ok(()) => {
+                if self.idle_seconds != seconds {
+                    self.sample = None;
+                    self.continuing = None;
+                }
+                self.idle_seconds = seconds;
+                self.idle_notice = Some("Idle timeout saved.".into());
+            }
+            Err(error) => {
+                self.idle_notice = Some(format!("Could not save the idle timeout. {error}"))
+            }
+        }
+    }
+
     fn refresh_apps(&mut self) {
         match self.store.apps() {
             Ok(mut apps) => {
@@ -333,6 +494,50 @@ impl State {
         }
     }
 
+    fn toggle_idle_exception(&mut self, app: &AppId) {
+        let enabled = !self.idle_exceptions.contains(&app.key);
+        match self.store.set_idle_exception(app, enabled) {
+            Ok(()) => match self.store.idle_exceptions() {
+                Ok(exceptions) => {
+                    self.idle_exceptions = exceptions;
+                    self.idle_exception_error = None;
+                }
+                Err(error) => {
+                    self.idle_exception_error =
+                        Some(format!("Could not refresh idle exceptions. {error}"))
+                }
+            },
+            Err(error) => {
+                self.idle_exception_error =
+                    Some(format!("Could not save the idle exception. {error}"))
+            }
+        }
+    }
+
+    fn refresh_synced_preferences(&mut self) {
+        if let Ok(cutoff) = self.store.cutoff()
+            && cutoff != self.cutoff
+        {
+            if self.cutoff_input.text == self.cutoff.to_string() {
+                self.cutoff_input = TextEdit::new(cutoff.to_string());
+            }
+            self.cutoff = cutoff;
+        }
+        if let Ok(idle) = self.store.idle_seconds()
+            && idle != self.idle_seconds
+        {
+            if self.idle_input.text == self.idle_seconds.to_string() {
+                self.idle_input = TextEdit::new(idle.to_string());
+            }
+            self.idle_seconds = idle;
+            self.sample = None;
+            self.continuing = None;
+        }
+        if let Ok(exceptions) = self.store.idle_exceptions() {
+            self.idle_exceptions = exceptions;
+        }
+    }
+
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         self.sample = None;
@@ -350,10 +555,53 @@ impl State {
     }
 
     fn open_folder(&mut self, folder: Option<String>) {
+        self.folder_name = TextEdit::new(
+            folder
+                .as_ref()
+                .and_then(|key| self.folders.get(key))
+                .map_or("", String::as_str),
+        );
+        self.group_edit = None;
+        self.folder_notice = None;
         self.folder = folder;
         self.selection.clear();
         self.selection_anchor = None;
         self.update_editor();
+    }
+
+    fn change_folder(&mut self, delete: bool) {
+        let Some(key) = self
+            .folder
+            .clone()
+            .filter(|key| self.folders.contains_key(key))
+        else {
+            return;
+        };
+        let name = self.folder_name.text.trim().to_owned();
+        if !delete && (name.is_empty() || !valid_folder_name(&name)) {
+            self.folder_notice =
+                Some("Enter a group name of up to 64 characters. Ungrouped is reserved.".into());
+            return;
+        }
+        match self
+            .store
+            .change_folder(&key, (!delete).then_some(name.as_str()))
+        {
+            Ok(true) => {
+                self.refresh_apps();
+                self.open_folder((!delete).then(|| name.to_lowercase()));
+                if self.report_group.as_ref() == Some(&key) {
+                    self.report_group = self.folder.clone();
+                }
+                self.folder_notice = Some(if delete {
+                    "Group deleted. Its apps are now Ungrouped.".into()
+                } else {
+                    format!("Group renamed to {name}.")
+                });
+            }
+            Ok(false) => self.folder_notice = Some("A group with that name already exists.".into()),
+            Err(error) => self.folder_notice = Some(format!("Could not update the group. {error}")),
+        }
     }
 
     fn select(&mut self, key: &str, ctrl: bool, shift: bool) {
@@ -401,10 +649,7 @@ impl State {
     }
 
     fn move_to_group(&mut self, name: &str) {
-        if name.chars().count() > 64
-            || name.chars().any(char::is_control)
-            || name.eq_ignore_ascii_case("ungrouped")
-        {
+        if !valid_folder_name(name) {
             self.notice = Some(
                 "Use up to 64 characters on one line. Leave the group blank for Ungrouped.".into(),
             );
@@ -422,7 +667,7 @@ impl State {
             .map(|app| app.id.clone())
             .collect();
         if apps.is_empty() && canonical.is_empty() {
-            self.notice = Some("Enter a name for the folder.".into());
+            self.notice = Some("Enter a name for the group.".into());
             return;
         }
         match self.store.save_groups(&apps, &canonical) {
@@ -441,7 +686,7 @@ impl State {
                     self.group_input = TextEdit::new(&canonical);
                 }
                 self.notice = Some(if apps.is_empty() {
-                    format!("Folder {canonical} is ready.")
+                    format!("Group {canonical} is ready.")
                 } else if canonical.is_empty() {
                     format!("Moved {} to Ungrouped.", app_count(apps.len()))
                 } else {
@@ -492,6 +737,12 @@ fn app_count(count: usize) -> String {
     format!("{count} {}", if count == 1 { "app" } else { "apps" })
 }
 
+fn valid_folder_name(name: &str) -> bool {
+    name.chars().count() <= 64
+        && !name.chars().any(char::is_control)
+        && !name.eq_ignore_ascii_case("ungrouped")
+}
+
 fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
     if !state.live {
         return false;
@@ -515,13 +766,52 @@ fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
     state.today = today;
 
+    if state
+        .sync
+        .as_mut()
+        .is_some_and(|sync| sync.tick(&mut state.store, clock))
+    {
+        refresh = true;
+        state.refresh_synced_preferences();
+        match state.screen {
+            Screen::Calendar => state.show_month(state.month),
+            Screen::Settings => {
+                state.refresh_apps();
+                if state
+                    .folder
+                    .as_ref()
+                    .is_some_and(|key| !key.is_empty() && !state.folders.contains_key(key))
+                {
+                    state.open_folder(None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let last_input = (state.idle_seconds != 0).then(platform::idle_ms).flatten();
+    let time = Utc::now().timestamp_millis();
+    let last_input = last_input.map(|idle| time - i64::from(idle));
+    let idle_at = last_input.map(|time| time + i64::from(state.idle_seconds) * 1000);
+    let timed_out = idle_at.is_some_and(|deadline| time >= deadline);
+    let mut idle_exempt = false;
+    let app = if state.paused || (timed_out && state.idle_exceptions.is_empty()) {
+        None
+    } else {
+        platform::foreground(|app| {
+            idle_exempt = state.idle_exceptions.contains(&app.key)
+                || state
+                    .idle_exceptions
+                    .contains(&format!("sync:{}", app.name.to_lowercase()));
+            !timed_out || idle_exempt
+        })
+    };
+    state.idle = timed_out && !idle_exempt;
     let mut current = Sample {
-        app: if state.paused {
-            None
-        } else {
-            platform::foreground()
-        },
-        time: Utc::now().timestamp_millis(),
+        app,
+        time,
+        idle_at,
+        idle_exempt,
     };
     let domain = state.website_probe.as_ref().and_then(|probe| {
         let domain = probe.result(state.sample.as_ref().map(|sample| sample.time));
@@ -534,22 +824,23 @@ fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
     let current = state.sample.as_ref().unwrap();
     let mut next_session = None;
     if let Some(previous) = old
+        && let Some(end) = previous.active_end(current, last_input)
         && let Some(focused) = previous.app
-        && (1..=2500).contains(&(current.time - previous.time))
     {
         match state.store.record(
             &focused.app,
             previous.time,
-            current.time,
+            end,
             state.continuing,
             focused.page_title.as_deref(),
             domain.as_deref(),
         ) {
             Ok(id) => {
-                if current
-                    .app
-                    .as_ref()
-                    .is_some_and(|next| next.app.key == focused.app.key)
+                if end == current.time
+                    && current
+                        .app
+                        .as_ref()
+                        .is_some_and(|next| next.app.key == focused.app.key)
                 {
                     next_session = Some(id);
                 }
@@ -670,8 +961,38 @@ fn spec() -> AppSpec<State> {
             }
         }),
         poll: Some(poll),
+        on_key: Some(ui::search_key),
         scenes: &[
             ("populated", sample_data),
+            ("synced", |s| {
+                sample_data(s);
+                let start = s.sessions.last().unwrap().start + 15 * 60_000;
+                let device = "sample-laptop".to_owned();
+                let devices = BTreeMap::from([(device.clone(), "Laptop".to_owned())]);
+                s.store
+                    .apply_sync(
+                        &[],
+                        1,
+                        &[sync::Delta {
+                            device,
+                            id: 1,
+                            app: "Firefox".to_owned(),
+                            start,
+                            end: start + 30 * 60_000,
+                            pages: Vec::new(),
+                            domains: Vec::new(),
+                        }],
+                        &devices,
+                        None,
+                    )
+                    .unwrap();
+                s.refresh();
+            }),
+            ("settings", |s| {
+                sample_data(s);
+                s.sync = Some(sync::Client::preview());
+                s.show_screen(Screen::Settings);
+            }),
             ("aliases", |s| {
                 sample_data(s);
                 s.show_screen(Screen::Settings);
@@ -732,7 +1053,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .join("Molo Tracker");
     std::fs::create_dir_all(&dir)?;
-    let store = Store::open(&dir.join("activity.sqlite3"))?;
+    let mut store = Store::open(&dir.join("activity.sqlite3"))?;
+    let (sync, sync_error) = match sync::Client::open(&dir.join("sync.toml"), &mut store) {
+        Ok(client) => (Some(client), None),
+        Err(error) => (None, Some(format!("Sync setup failed. {error}"))),
+    };
     let app = App::new(spec());
     let handle = app.handle();
     let tray = Tray::new(
@@ -752,6 +1077,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let tray_available = tray.is_ok();
     let app = app.init(move || {
         let mut state = State::new(store, true);
+        state.sync = sync;
+        state.sync_error = sync_error;
         if !tray_available {
             state.notice = Some(
                 "The notification area is unavailable. Closing Molo will stop tracking.".into(),

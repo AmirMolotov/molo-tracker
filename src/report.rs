@@ -72,6 +72,7 @@ pub struct Report {
     pub total: Usage,
     pub previous: Usage,
     pub websites: Vec<WebsiteUsage>,
+    pub devices: Vec<crate::store::DeviceUsage>,
 }
 
 #[derive(Default)]
@@ -139,7 +140,10 @@ impl Report {
                 .current = usage;
         }
 
-        let mut result = Self::default();
+        let mut result = Self {
+            devices: store.devices(start, end)?,
+            ..Self::default()
+        };
         let mut groups = BTreeMap::new();
         for app in by_app.into_values() {
             let key = group_key(&app.app);

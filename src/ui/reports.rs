@@ -137,9 +137,39 @@ pub(super) fn view(s: &State, compact: bool) -> El {
     } else {
         report
             .child(summary)
+            .children(device_breakdown(s))
             .child(groups(s, compact))
             .child(apps(s, compact))
     }
+}
+
+fn device_breakdown(s: &State) -> Option<El> {
+    let devices = &s.report.devices;
+    if devices.is_empty() {
+        return None;
+    }
+    let mut card = panel()
+        .key("report-devices")
+        .child(heading("Time by device", 2));
+    if devices.iter().map(|device| device.time).sum::<i64>() > s.report.total.time {
+        card = card.child(empty_message(
+            "Device totals include overlapping time. The combined total counts it once.",
+        ));
+    }
+    let entries = col().gap(8.0).children(devices.iter().map(|usage| {
+        row()
+            .key(format!("report-device:{}", usage.device.id))
+            .center_y()
+            .gap(12.0)
+            .child(
+                label(usage.device.label(), BODY, color(INK))
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .wrap(),
+            )
+            .child(label(duration(usage.time), TIME, color(INK)))
+    }));
+    Some(card.child(entries))
 }
 
 fn websites(s: &State, compact: bool) -> El {

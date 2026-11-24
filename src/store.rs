@@ -1,8 +1,16 @@
 use chrono::{Days, Local, NaiveDate, TimeZone};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::platform::AppId;
+
+mod coverage;
+mod preferences;
+mod sync;
+pub(crate) use coverage::covered;
+
+pub const DEFAULT_IDLE_SECONDS: u32 = 300;
 
 #[derive(Clone, Debug)]
 pub struct Application {
@@ -39,6 +47,45 @@ pub struct Session {
     pub start: i64,
     pub end: i64,
     pub full_duration: i64,
+    pub device: Device,
+    pub source_id: i64,
+    pub original_start: i64,
+}
+
+#[derive(Clone)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub local: bool,
+}
+
+impl Device {
+    pub fn label(&self) -> String {
+        if self.local {
+            format!("{} (this PC)", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+pub struct DeviceUsage {
+    pub device: Device,
+    pub time: i64,
+}
+
+pub(crate) fn local_device_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| {
+            name.trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect()
+        })
+        .unwrap_or_else(|| "Windows PC".into())
 }
 
 impl Session {
@@ -101,9 +148,24 @@ impl Store {
                  id INTEGER PRIMARY KEY CHECK(id = 1),
                  cutoff INTEGER NOT NULL
              );
-             INSERT OR IGNORE INTO settings(id, cutoff) VALUES (1, 5);",
+             INSERT OR IGNORE INTO settings(id, cutoff) VALUES (1, 5);
+             CREATE TABLE IF NOT EXISTS idle_exceptions (
+                 app TEXT PRIMARY KEY REFERENCES apps(path)
+             );",
         )?;
-        Ok(Self(db))
+        let mut migration = db.prepare(
+            "SELECT name FROM pragma_table_info('settings') WHERE name = 'idle_seconds'",
+        )?;
+        if !migration.exists([])? {
+            db.execute(
+                "ALTER TABLE settings ADD COLUMN idle_seconds INTEGER NOT NULL DEFAULT 300",
+                [],
+            )?;
+        }
+        drop(migration);
+        let mut store = Self(db);
+        store.initialize_sync()?;
+        Ok(store)
     }
 
     pub fn cutoff(&self) -> rusqlite::Result<u32> {
@@ -119,11 +181,53 @@ impl Store {
         Ok(())
     }
 
+    pub fn idle_seconds(&self) -> rusqlite::Result<u32> {
+        self.0.query_row(
+            "SELECT idle_seconds FROM settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn save_idle_seconds(&self, seconds: u32) -> rusqlite::Result<()> {
+        self.0.execute(
+            "UPDATE settings SET idle_seconds = ?1 WHERE id = 1",
+            [seconds],
+        )?;
+        Ok(())
+    }
+
+    pub fn idle_exceptions(&self) -> rusqlite::Result<BTreeSet<String>> {
+        let mut query = self.0.prepare("SELECT app FROM idle_exceptions")?;
+        query.query_map([], |row| row.get(0))?.collect()
+    }
+
+    pub fn set_idle_exception(&mut self, app: &AppId, enabled: bool) -> rusqlite::Result<()> {
+        let tx = self.0.transaction()?;
+        if enabled {
+            Self::register(&tx, app)?;
+        }
+        for path in Self::preference_paths(&tx, app)? {
+            if enabled {
+                tx.execute(
+                    "INSERT OR IGNORE INTO idle_exceptions(app) VALUES (?1)",
+                    [&path],
+                )?;
+            } else {
+                tx.execute("DELETE FROM idle_exceptions WHERE app = ?1", [&path])?;
+            }
+        }
+        tx.commit()
+    }
+
     fn register(db: &Connection, app: &AppId) -> rusqlite::Result<()> {
-        db.execute(
+        let inserted = db.execute(
             "INSERT OR IGNORE INTO apps(path, name) VALUES(?1, ?2)",
             params![app.key, app.name],
         )?;
+        if inserted != 0 {
+            Self::inherit_preferences(db, app)?;
+        }
         Ok(())
     }
 
@@ -131,26 +235,64 @@ impl Store {
         let tx = self.0.transaction()?;
         Self::register(&tx, app)?;
         let alias = Some(value.trim()).filter(|alias| !alias.is_empty());
-        tx.execute(
-            "UPDATE apps SET alias = ?2 WHERE path = ?1",
-            params![app.key, alias],
-        )?;
+        for path in Self::preference_paths(&tx, app)? {
+            tx.execute(
+                "UPDATE apps SET alias = ?2 WHERE path = ?1",
+                params![path, alias],
+            )?;
+        }
         tx.commit()
     }
 
     pub fn apps(&self) -> rusqlite::Result<Vec<Application>> {
         let mut query = self.0.prepare(
             "SELECT apps.path, apps.name, apps.alias, app_groups.name
-             FROM apps LEFT JOIN app_groups ON app_groups.app = apps.path",
+             FROM apps LEFT JOIN app_groups ON app_groups.app = apps.path
+             WHERE apps.path NOT LIKE 'sync:%' OR NOT EXISTS (
+                 SELECT 1 FROM apps AS origin WHERE origin.path NOT LIKE 'sync:%'
+                 AND lower(origin.name)=lower(apps.name)
+             )",
         )?;
         query.query_map([], read_app)?.collect()
     }
 
     pub fn group_folders(&self) -> rusqlite::Result<Vec<String>> {
-        let mut query = self
-            .0
-            .prepare("SELECT name FROM group_folders UNION SELECT name FROM app_groups")?;
+        Self::folder_names(&self.0)
+    }
+
+    fn folder_names(db: &Connection) -> rusqlite::Result<Vec<String>> {
+        let mut query =
+            db.prepare("SELECT name FROM group_folders UNION SELECT name FROM app_groups")?;
         query.query_map([], |row| row.get(0))?.collect()
+    }
+
+    pub fn change_folder(&mut self, key: &str, new_name: Option<&str>) -> rusqlite::Result<bool> {
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let names = Self::folder_names(&tx)?;
+        if let Some(name) = new_name {
+            let new_key = name.to_lowercase();
+            if new_key != key && names.iter().any(|name| name.to_lowercase() == new_key) {
+                return Ok(false);
+            }
+        }
+        for name in names.iter().filter(|name| name.to_lowercase() == key) {
+            tx.execute("DELETE FROM group_folders WHERE name = ?1", [name])?;
+            if let Some(new_name) = new_name {
+                tx.execute(
+                    "UPDATE app_groups SET name = ?2 WHERE name = ?1",
+                    params![name, new_name],
+                )?;
+            } else {
+                tx.execute("DELETE FROM app_groups WHERE name = ?1", [name])?;
+            }
+        }
+        if let Some(name) = new_name {
+            tx.execute("INSERT INTO group_folders(name) VALUES (?1)", [name])?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn save_groups(&mut self, apps: &[AppId], name: &str) -> rusqlite::Result<()> {
@@ -163,14 +305,16 @@ impl Store {
         }
         for app in apps {
             Self::register(&tx, app)?;
-            if name.is_empty() {
-                tx.execute("DELETE FROM app_groups WHERE app = ?1", [&app.key])?;
-            } else {
-                tx.execute(
-                    "INSERT INTO app_groups(app, name) VALUES(?1, ?2)
-                     ON CONFLICT(app) DO UPDATE SET name = excluded.name",
-                    params![app.key, name],
-                )?;
+            for path in Self::preference_paths(&tx, app)? {
+                if name.is_empty() {
+                    tx.execute("DELETE FROM app_groups WHERE app = ?1", [&path])?;
+                } else {
+                    tx.execute(
+                        "INSERT INTO app_groups(app, name) VALUES(?1, ?2)
+                         ON CONFLICT(app) DO UPDATE SET name = excluded.name",
+                        params![path, name],
+                    )?;
+                }
             }
         }
         tx.commit()
@@ -184,25 +328,27 @@ impl Store {
         let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
             return Ok(Vec::new());
         };
-        let mut query = self.0.prepare(
-            "SELECT apps.path, apps.name, apps.alias, app_groups.name,
-                    SUM(MIN(sessions.end, ?2) - MAX(sessions.start, ?1)), SUM(sessions.start >= ?1)
-             FROM sessions JOIN apps ON apps.path = sessions.app
-             LEFT JOIN app_groups ON app_groups.app = apps.path
-             WHERE sessions.end > ?1 AND sessions.start < ?2
-             GROUP BY apps.path",
-        )?;
-        query
-            .query_map(params![start, end], |row| {
-                Ok((
-                    read_app(row)?,
-                    Usage {
-                        time: row.get(4)?,
-                        sessions: row.get(5)?,
-                    },
-                ))
-            })?
-            .collect()
+        let sessions = self.range(start, end)?;
+        let mut apps = BTreeMap::new();
+        let mut counted = BTreeSet::new();
+        for part in covered(&sessions) {
+            let session = part.session;
+            let (_, usage) = apps
+                .entry(&session.app.id.key)
+                .or_insert_with(|| (session.app.clone(), Usage::default()));
+            usage.time += part.end - part.start;
+            if session.original_start >= start && counted.insert(session.id) {
+                usage.sessions += 1;
+            }
+        }
+        Ok(apps.into_values().collect())
+    }
+
+    pub fn devices(&self, start: NaiveDate, end: NaiveDate) -> rusqlite::Result<Vec<DeviceUsage>> {
+        let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
+            return Ok(Vec::new());
+        };
+        Ok(coverage::device_usage(&self.range(start, end)?))
     }
 
     pub fn record(
@@ -257,6 +403,11 @@ impl Store {
                 params![id, domain, start, end],
             )?;
         }
+        tx.execute(
+            "INSERT INTO sync_pending(session, end) VALUES (?1, ?2)
+                    ON CONFLICT(session) DO UPDATE SET end = excluded.end",
+            params![id, end],
+        )?;
         tx.commit()?;
         Ok(id)
     }
@@ -269,24 +420,51 @@ impl Store {
         let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
             return Ok(Vec::new());
         };
+        let sessions = self.range(start, end)?;
+        let mut intervals = BTreeMap::<i64, Vec<(i64, i64)>>::new();
+        for part in covered(&sessions) {
+            intervals
+                .entry(part.session.id)
+                .or_default()
+                .push((part.start, part.end));
+        }
         let mut query = self.0.prepare(
-            "SELECT website_focus.domain,
-                SUM(CASE WHEN lower(apps.name) = 'chrome' THEN MIN(website_focus.end, ?2) - MAX(website_focus.start, ?1) ELSE 0 END),
-                SUM(CASE WHEN lower(apps.name) = 'firefox' THEN MIN(website_focus.end, ?2) - MAX(website_focus.start, ?1) ELSE 0 END)
+            "SELECT website_focus.session_id, website_focus.domain, website_focus.start,
+                    website_focus.end, lower(apps.name)
              FROM website_focus JOIN sessions ON sessions.id = website_focus.session_id
              JOIN apps ON apps.path = sessions.app
-             WHERE website_focus.end > ?1 AND website_focus.start < ?2
-             GROUP BY website_focus.domain",
+             WHERE website_focus.end > ?1 AND website_focus.start < ?2",
         )?;
-        query
-            .query_map(params![start, end], |row| {
-                Ok(WebsiteTime {
-                    domain: row.get(0)?,
-                    chrome: row.get(1)?,
-                    firefox: row.get(2)?,
-                })
-            })?
-            .collect()
+        let mut rows = query.query(params![start, end])?;
+        let mut domains = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let Some(parts) = intervals.get(&row.get::<_, i64>(0)?) else {
+                continue;
+            };
+            let domain: String = row.get(1)?;
+            let start: i64 = row.get(2)?;
+            let end: i64 = row.get(3)?;
+            let first = parts.partition_point(|&(_, stop)| stop <= start);
+            let time: i64 = parts[first..]
+                .iter()
+                .take_while(|&&(begin, _)| begin < end)
+                .map(|&(begin, stop)| stop.min(end) - begin.max(start))
+                .sum();
+            if time == 0 {
+                continue;
+            }
+            let usage = domains.entry(domain.clone()).or_insert(WebsiteTime {
+                domain,
+                chrome: 0,
+                firefox: 0,
+            });
+            match row.get::<_, String>(4)?.as_str() {
+                "chrome" => usage.chrome += time,
+                "firefox" => usage.firefox += time,
+                _ => {}
+            }
+        }
+        Ok(domains.into_values().collect())
     }
 
     pub fn pages(&self, session: &Session) -> rusqlite::Result<Vec<BrowserPage>> {
@@ -326,8 +504,16 @@ impl Store {
             return Ok(0);
         };
         self.0.query_row(
-            "SELECT COALESCE(SUM(MIN(end, ?2) - MAX(start, ?1)), 0) FROM sessions
-             WHERE end > ?1 AND start < ?2",
+            "WITH intervals AS (
+                 SELECT MAX(start, ?1) AS start, MIN(end, ?2) AS end, id
+                 FROM sessions WHERE end > ?1 AND start < ?2
+             ), coverage AS (
+                 SELECT start, end, MAX(end) OVER (
+                     ORDER BY start, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                 ) AS prior_end FROM intervals
+             )
+             SELECT COALESCE(SUM(MAX(0, end - MAX(start, COALESCE(prior_end, start)))), 0)
+             FROM coverage",
             params![start, end],
             |row| row.get(0),
         )
@@ -341,22 +527,48 @@ impl Store {
     }
 
     fn range(&self, start: i64, end: i64) -> rusqlite::Result<Vec<Session>> {
+        let local = local_device_name();
         let mut query = self.0.prepare(
             "SELECT apps.path, apps.name, apps.alias, app_groups.name, MAX(sessions.start, ?1), MIN(sessions.end, ?2),
-                    sessions.id, sessions.end - sessions.start
+                    sessions.id, sessions.end - sessions.start, sessions.start,
+                    sync_import.device, sync_import.remote, sync_devices.name, sync_profile.device
              FROM sessions JOIN apps ON apps.path = sessions.app
+             CROSS JOIN sync_profile
              LEFT JOIN app_groups ON app_groups.app = apps.path
+             LEFT JOIN sync_import ON sync_import.session = sessions.id
+             LEFT JOIN sync_devices ON sync_devices.id = sync_import.device
              WHERE sessions.end > ?1 AND sessions.start < ?2
              ORDER BY sessions.start DESC, sessions.id DESC",
         )?;
         query
             .query_map(params![start, end], |row| {
+                let remote: Option<String> = row.get(9)?;
+                let device = match remote {
+                    Some(id) => Device {
+                        name: row
+                            .get::<_, Option<String>>(11)?
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| {
+                                format!("Device {}", id.chars().take(8).collect::<String>())
+                            }),
+                        id,
+                        local: false,
+                    },
+                    None => Device {
+                        id: row.get(12)?,
+                        name: local.clone(),
+                        local: true,
+                    },
+                };
                 Ok(Session {
                     app: read_app(row)?,
                     start: row.get(4)?,
                     end: row.get(5)?,
                     id: row.get(6)?,
                     full_duration: row.get(7)?,
+                    original_start: row.get(8)?,
+                    source_id: row.get::<_, Option<i64>>(10)?.unwrap_or(row.get(6)?),
+                    device,
                 })
             })?
             .collect()
@@ -408,6 +620,60 @@ fn day_bounds(date: NaiveDate) -> Option<(i64, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_exception_can_be_added_for_an_unrecorded_app_and_removed() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let app = AppId {
+            key: "player.exe".into(),
+            name: "Player".into(),
+        };
+        assert!(store.idle_exceptions().unwrap().is_empty());
+        store.set_idle_exception(&app, true).unwrap();
+        assert_eq!(
+            store.idle_exceptions().unwrap(),
+            BTreeSet::from([app.key.clone()])
+        );
+        assert_eq!(store.apps().unwrap()[0].label(), "Player");
+        store.set_idle_exception(&app, false).unwrap();
+        assert!(store.idle_exceptions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn editing_folders_preserves_sessions_and_handles_empty_folders() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let app = AppId {
+            key: "editor.exe".into(),
+            name: "Editor".into(),
+        };
+        store
+            .save_groups(std::slice::from_ref(&app), "Écriture")
+            .unwrap();
+        store.save_groups(&[], "Work").unwrap();
+        store.record(&app, 1000, 2000, None, None, None).unwrap();
+
+        assert!(!store.change_folder("écriture", Some("work")).unwrap());
+        assert!(store.change_folder("écriture", Some("ÉCRITURE")).unwrap());
+        assert_eq!(store.apps().unwrap()[0].group.as_deref(), Some("ÉCRITURE"));
+        assert!(store.change_folder("work", Some("Projects")).unwrap());
+        assert!(store.change_folder("écriture", None).unwrap());
+        assert_eq!(store.group_folders().unwrap(), ["Projects"]);
+        let sessions = store.range(1000, 2000).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].app.group.is_none());
+    }
+
+    #[test]
+    fn idle_setting_can_be_changed_or_disabled() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        assert_eq!(store.idle_seconds().unwrap(), DEFAULT_IDLE_SECONDS);
+        assert_eq!(store.cutoff().unwrap(), 5);
+        store.save_idle_seconds(45).unwrap();
+        assert_eq!(store.idle_seconds().unwrap(), 45);
+        store.save_idle_seconds(0).unwrap();
+        assert_eq!(store.idle_seconds().unwrap(), 0);
+        assert_eq!(store.cutoff().unwrap(), 5);
+    }
 
     #[test]
     fn sessions_extend_clip_and_keep_the_current_alias() {

@@ -4,11 +4,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use chrono::{Datelike, Days, Local, TimeZone};
 use rune::tok::motion;
 use rune::{
-    Color, Cx, El, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el, row, text, text_input,
+    Color, Cx, El, Key, KeyEvent, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el, row,
+    text, text_input,
 };
 
 use crate::store::Session;
-use crate::{Screen, State};
+use crate::{GroupEdit, Screen, State};
 
 mod reports;
 
@@ -114,23 +115,29 @@ fn search_field(
     edit: &TextEdit,
     access: fn(&mut State) -> &mut TextEdit,
 ) -> El {
-    let gold = color(0xdabb84);
+    let accent = color(FOREST);
     let field = key.to_owned();
+    let searching = !edit.text.is_empty();
+    let style = if searching {
+        TextStyle::new(38.0, 620.0).tracking(-1.0)
+    } else {
+        BODY
+    };
     let mut bar = row()
         .w_full()
         .min_w(0.0)
-        .h(44.0)
+        .h(if searching { 68.0 } else { 44.0 })
         .radius(7.0)
         .center_y()
         .gap(10.0)
-        .fill(color(0x252c28))
-        .border(1.0, color(0x54594a))
-        .focus_within_ring(2.0, 1.0, gold)
+        .fill(color(BASE))
+        .border(1.0, color(0xaab8aa))
+        .focus_within_ring(2.0, 1.0, accent)
         .child(
             el().size(34.0, 34.0)
                 .ml(4.0)
                 .radius(4.0)
-                .fill(color(0x383f36))
+                .fill(color(0xddebd6))
                 .center()
                 .child(
                     el().size(17.0, 17.0).a11y_hidden().shape(
@@ -143,25 +150,39 @@ fn search_field(
                                     })
                                     .collect::<Vec<_>>(),
                                 1.6,
-                                gold,
+                                accent,
                             )
-                            .line([10.4, 10.4], [15.0, 15.0], 1.6, rune::LineCap::Round, gold)
+                            .line(
+                                [10.4, 10.4],
+                                [15.0, 15.0],
+                                1.6,
+                                rune::LineCap::Round,
+                                accent,
+                            )
                             .view_box(17.0, 17.0),
                     ),
                 ),
         )
         .child(
-            text_input(edit, BODY)
+            text_input(edit, style)
                 .key(key)
                 .label(hint)
+                .single_line()
                 .min_w(0.0)
                 .grow(1.0)
-                .color(color(PAPER))
-                .placeholder(hint, color(0xbfc6b9))
-                .caret(gold, color(0x58614d))
-                .on_edit(access),
+                .color(color(INK))
+                .placeholder(hint, color(MUTED))
+                .caret(accent, color(0xc1daa9))
+                .on_edit(access)
+                .on_input_key(move |s, event, _| {
+                    if event.key == Key::Escape && !access(s).text.is_empty() {
+                        *access(s) = TextEdit::new("");
+                        return true;
+                    }
+                    false
+                }),
         );
-    if !edit.text.is_empty() {
+    if searching {
         bar = bar.child(
             row()
                 .key(format!("{key}-clear"))
@@ -169,15 +190,16 @@ fn search_field(
                 .center()
                 .role("button")
                 .label("Clear search")
+                .help("Clear search (Esc)")
                 .focusable(true)
-                .focus_ring(2.0, -3.0, gold)
+                .focus_ring(2.0, -3.0, accent)
                 .radius(6.0)
-                .hover(color(0x464e42))
+                .hover(color(0xddebd6))
                 .on_press_tx(move |s: &mut State, tx| {
                     *access(s) = TextEdit::new("");
                     tx.focus(&field, true);
                 })
-                .child(label("×", TextStyle::new(19.0, 500.0), gold)),
+                .child(label("×", TextStyle::new(19.0, 500.0), accent)),
         );
     } else {
         bar = bar.child(el().w(11.0));
@@ -187,6 +209,49 @@ fn search_field(
 
 fn search_query(edit: &TextEdit) -> String {
     edit.text.trim().to_lowercase()
+}
+
+pub fn search_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    let (field, edit) = match s.screen {
+        Screen::Activity => ("chart-search", &mut s.chart_search),
+        Screen::Settings if s.idle_exceptions_open => {
+            ("idle-exception-search", &mut s.idle_exception_search)
+        }
+        Screen::Settings => ("folder-search", &mut s.folder_search),
+        Screen::Reports if s.report_websites => {
+            ("report-website-search", &mut s.report_website_search)
+        }
+        Screen::Reports => ("report-app-search", &mut s.report_app_search),
+        Screen::Calendar => return false,
+    };
+    if event.is_command('f') {
+        let field = tx
+            .focused()
+            .filter(|key| key.ends_with("-search"))
+            .unwrap_or(field)
+            .to_owned();
+        tx.scroll_center_in("page", &field);
+        tx.focus(field, true);
+        return true;
+    }
+    if tx
+        .focused()
+        .is_some_and(|key| key.ends_with("-input") || key.ends_with("-search"))
+        || event.is_command_chord()
+    {
+        return false;
+    }
+    if let Key::Text(value) = &event.key
+        && !value.trim().is_empty()
+        && !value.chars().any(char::is_control)
+    {
+        *edit = TextEdit::new("");
+        edit.insert(value);
+        tx.scroll_center_in("page", field);
+        tx.focus(field, true);
+        return true;
+    }
+    false
 }
 
 fn empty_message(message: &str) -> El {
@@ -230,11 +295,12 @@ fn time(ms: i64) -> String {
 
 fn activity(s: &State, compact: bool) -> El {
     let mut by_app = BTreeMap::new();
-    for session in &s.sessions {
+    for part in crate::store::covered(&s.sessions) {
+        let session = part.session;
         let total = by_app
             .entry(session.app.id.key.as_str())
             .or_insert((&session.app, 0));
-        total.1 += session.end - session.start;
+        total.1 += part.end - part.start;
     }
     let mut apps: Vec<_> = by_app.into_iter().collect();
     apps.sort_by(|a, b| {
@@ -521,17 +587,19 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
     if s.visible_apps().next().is_none() {
         entries = entries.child(empty_message(
             if search_query(&s.folder_search).is_empty() {
-                "No apps in this folder."
+                "No apps in this group."
             } else {
-                "No matching apps in this folder."
+                "No matching apps in this group."
             },
         ));
     }
     let list = panel().key("app-list").grow(1.0)
         .child(heading("App aliases and groups", 2))
-        .child(label("Ctrl-click to toggle apps or Shift-click to select a range. Drop selected apps on a folder.", BODY, color(MUTED)).wrap())
+        .child(label("Ctrl-click to toggle apps or Shift-click to select a range. Drop selected apps on a group.", BODY, color(MUTED)).wrap())
         .child(folders)
-        .child(search_field("folder-search", "Search apps in this folder", &s.folder_search, |s| &mut s.folder_search))
+        .children(s.folder.as_ref().and_then(|key| s.folders.get(key)).map(|name| folder_editor(s, name)))
+        .children(s.folder_notice.as_ref().map(|message| label(message, BODY, color(FOREST)).wrap()))
+        .child(search_field("folder-search", "Search apps in this group", &s.folder_search, |s| &mut s.folder_search))
         .child(col().key("folder-apps").w_full().h(if compact { 210.0 } else { 298.0 })
             .scroll(ScrollSpec { stick_bottom: false }).child(entries));
 
@@ -587,12 +655,12 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
         );
     }
     let action = if s.selection.is_empty() {
-        "Create folder"
+        "Create group"
     } else {
-        "Move to folder"
+        "Move to group"
     };
     editor = editor
-        .child(label("FOLDER NAME", LABEL, color(MUTED)))
+        .child(label("GROUP NAME", LABEL, color(MUTED)))
         .child(
             el().w_full()
                 .h(44.0)
@@ -604,7 +672,7 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
                 .child(
                     text_input(&s.group_input, BODY)
                         .key("group-input")
-                        .label("Folder name")
+                        .label("Group name")
                         .color(color(INK))
                         .w_full()
                         .on_edit(|s: &mut State| &mut s.group_input)
@@ -624,6 +692,217 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
         .gap(14.0)
         .child(list)
         .child(editor)
+}
+
+fn folder_editor(s: &State, folder: &str) -> El {
+    let name = folder.to_owned();
+    let bar = row().center_y().gap(8.0).child(
+        label(folder, TextStyle::new(16.0, 650.0), color(INK))
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate()
+            .help_when_truncated(folder),
+    );
+    let editor = col().key("folder-editor").gap(10.0).child(separator());
+    let editor = match s.group_edit {
+        None => editor.child(
+            bar.child(group_action(
+                "rename-folder",
+                "Rename",
+                "Rename group",
+                false,
+                false,
+                move |s, tx| {
+                    s.group_edit = Some(GroupEdit::Rename);
+                    s.folder_name = TextEdit::new(&name);
+                    s.folder_notice = None;
+                    tx.focus("folder-name-input", true);
+                },
+            ))
+            .child(group_action(
+                "delete-folder",
+                "Delete",
+                "Delete group",
+                true,
+                false,
+                |s, tx| {
+                    s.group_edit = Some(GroupEdit::Delete);
+                    s.folder_notice = None;
+                    tx.focus("cancel-folder-delete", true);
+                },
+            )),
+        ),
+        Some(GroupEdit::Rename) => editor.child(bar).child(
+            col()
+                .gap(8.0)
+                .child(
+                    el().w_full()
+                        .h(44.0)
+                        .px(10.0)
+                        .center_y()
+                        .radius(8.0)
+                        .border(1.0, color(LINE))
+                        .fill(color(BASE))
+                        .focus_within_ring(2.0, 1.0, color(FOREST))
+                        .child(
+                            text_input(&s.folder_name, BODY)
+                                .key("folder-name-input")
+                                .label("New name for the selected group")
+                                .single_line()
+                                .color(color(INK))
+                                .w_full()
+                                .on_edit(|s: &mut State| &mut s.folder_name)
+                                .on_submit(save_group_name),
+                        ),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .justify_end()
+                        .gap(8.0)
+                        .flex_wrap()
+                        .child(button(
+                            "cancel-folder-rename",
+                            "Cancel",
+                            false,
+                            false,
+                            |s, tx| {
+                                s.group_edit = None;
+                                s.folder_notice = None;
+                                tx.focus("rename-folder", true);
+                            },
+                        ))
+                        .child(button(
+                            "save-folder-name",
+                            "Save name",
+                            true,
+                            s.folder_name.text.trim() == folder,
+                            save_group_name,
+                        )),
+                ),
+        ),
+        Some(GroupEdit::Delete) => editor.child(bar).child(
+            col()
+                .gap(8.0)
+                .child(
+                    label(
+                        "Its apps will move to Ungrouped. Their activity history will be kept.",
+                        BODY,
+                        color(MUTED),
+                    )
+                    .wrap(),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .justify_end()
+                        .gap(8.0)
+                        .flex_wrap()
+                        .child(button(
+                            "cancel-folder-delete",
+                            "Cancel",
+                            false,
+                            false,
+                            |s, tx| {
+                                s.group_edit = None;
+                                s.folder_notice = None;
+                                tx.focus("delete-folder", true);
+                            },
+                        ))
+                        .child(group_action(
+                            "confirm-folder-delete",
+                            "Delete group",
+                            "Confirm group deletion",
+                            true,
+                            true,
+                            |s, tx| {
+                                s.change_folder(true);
+                                if s.group_edit.is_none() {
+                                    tx.focus("folder-all", true);
+                                }
+                            },
+                        )),
+                ),
+        ),
+    };
+    editor.child(separator())
+}
+
+fn save_group_name(s: &mut State, tx: &mut Tx) {
+    s.change_folder(false);
+    if s.group_edit.is_none() {
+        tx.focus("rename-folder", true);
+    }
+}
+
+fn group_action(
+    key: &str,
+    title: &str,
+    accessible_name: &str,
+    delete: bool,
+    confirm: bool,
+    on_press: impl Fn(&mut State, &mut Tx) + 'static,
+) -> El {
+    let (ink, fill, border, hover) = if confirm {
+        (0xffffff, 0xa12b2b, 0xa12b2b, 0x852121)
+    } else if delete {
+        (0x902626, 0xf9ece8, 0xe3b0a9, 0xf3d9d4)
+    } else {
+        (FOREST, BASE, LINE, 0xddebd6)
+    };
+    let ink = color(ink);
+    let shape = if delete {
+        rune::Shape::new()
+            .stroke(vec![[3.0, 5.0], [15.0, 5.0]], 1.5, ink)
+            .stroke(
+                vec![[5.0, 5.0], [6.0, 15.0], [12.0, 15.0], [13.0, 5.0]],
+                1.5,
+                ink,
+            )
+            .stroke(
+                vec![[7.0, 5.0], [7.0, 3.0], [11.0, 3.0], [11.0, 5.0]],
+                1.5,
+                ink,
+            )
+    } else {
+        rune::Shape::new()
+            .stroke(
+                vec![
+                    [3.0, 15.0],
+                    [4.0, 11.0],
+                    [12.0, 3.0],
+                    [15.0, 6.0],
+                    [7.0, 14.0],
+                    [3.0, 15.0],
+                ],
+                1.5,
+                ink,
+            )
+            .stroke(vec![[10.0, 5.0], [13.0, 8.0]], 1.5, ink)
+    };
+    row()
+        .key(key)
+        .role("button")
+        .label(accessible_name)
+        .focusable(true)
+        .focus_ring(2.0, 2.0, color(if delete { 0x902626 } else { FOREST }))
+        .center()
+        .gap(6.0)
+        .h(44.0)
+        .min_w(88.0)
+        .px(10.0)
+        .radius(8.0)
+        .fill(color(fill))
+        .border(1.0, color(border))
+        .hover(color(hover))
+        .motion(motion::SNAPPY)
+        .on_press_tx(on_press)
+        .child(
+            el().size(18.0, 18.0)
+                .a11y_hidden()
+                .shape(shape.view_box(18.0, 18.0)),
+        )
+        .child(label(title, BODY, ink))
 }
 
 fn contains([x, y, w, h]: [f32; 4], [px, py]: [f32; 2]) -> bool {
@@ -732,7 +1011,126 @@ fn drag_ghost(s: &State, viewport: [f32; 2]) -> Option<El> {
     )
 }
 
+fn idle_exception_picker(s: &State) -> El {
+    let query = search_query(&s.idle_exception_search);
+    let mut matches = s.apps.iter().filter(|app| app.matches(&query)).peekable();
+    let mut picker = col()
+        .key("idle-exception-picker")
+        .gap(10.0)
+        .child(empty_message(
+            "Checked apps keep recording while they’re in the foreground, even when you’re idle.",
+        ))
+        .child(search_field(
+            "idle-exception-search",
+            "Find an app",
+            &s.idle_exception_search,
+            |s| &mut s.idle_exception_search,
+        ));
+    if matches.peek().is_none() {
+        return picker.child(empty_message(if s.apps.is_empty() {
+            "Open an app to see it here."
+        } else {
+            "No matching apps."
+        }));
+    }
+    let mut choices = col().gap(3.0);
+    for app in matches {
+        let id = app.id.clone();
+        let enabled = s.idle_exceptions.contains(&id.key);
+        let mut checkbox = el()
+            .size(18.0, 18.0)
+            .radius(4.0)
+            .border(1.0, color(if enabled { FOREST } else { MUTED }))
+            .fill(color(if enabled { FOREST } else { SURFACE }));
+        if enabled {
+            let mark = rune::Shape::new()
+                .stroke(vec![[4.0, 9.0], [7.5, 12.5], [14.0, 5.5]], 1.8, color(LIME))
+                .view_box(18.0, 18.0);
+            checkbox = checkbox.shape(mark);
+        }
+        choices = choices.child(
+            row()
+                .key(format!("idle-exception:{}", id.key))
+                .role("checkbox")
+                .label(app.label())
+                .checked(enabled)
+                .focusable(true)
+                .focus_ring(2.0, -2.0, color(FOREST))
+                .min_h(44.0)
+                .px(9.0)
+                .gap(9.0)
+                .center_y()
+                .radius(8.0)
+                .fill(color(if enabled { 0xddebd6 } else { SURFACE }))
+                .hover(color(BASE))
+                .on_press(move |s: &mut State| s.toggle_idle_exception(&id))
+                .child(checkbox)
+                .child(
+                    label(app.label(), BODY, color(INK))
+                        .min_w(0.0)
+                        .truncate()
+                        .help_when_truncated(app.label()),
+                ),
+        );
+    }
+    picker = picker.child(
+        col()
+            .key("idle-exception-list")
+            .max_h(223.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(choices),
+    );
+    picker
+}
+
 fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
+    let idle_input = el()
+        .w(95.0)
+        .h(44.0)
+        .px(10.0)
+        .center_y()
+        .radius(8.0)
+        .border(1.0, color(LINE))
+        .fill(color(BASE))
+        .child(
+            text_input(&s.idle_input, BODY)
+                .key("idle-input")
+                .label("Idle timeout in seconds")
+                .single_line()
+                .color(color(INK))
+                .w_full()
+                .on_edit(|s: &mut State| &mut s.idle_input)
+                .on_submit(|s: &mut State, _| s.save_idle()),
+        );
+    let mut idle = panel().key("idle-settings")
+        .child(heading("Idle detection", 2))
+        .child(label("Pause tracking after this long without mouse or keyboard input. Enter 0 to disable idle detection.", BODY, color(MUTED)).wrap())
+        .child(row().center_y().gap(8.0).flex_wrap()
+            .child(idle_input).child(label("seconds", BODY, color(MUTED)))
+            .child(button("save-idle", "Save", true, false, |s, _| s.save_idle())));
+    if let Some(message) = &s.idle_notice {
+        idle = idle.child(label(message, BODY, color(FOREST)).wrap());
+    }
+    let exceptions = format!("App exceptions ({})", s.idle_exceptions.len());
+    idle = idle.child(separator()).child(
+        row().child(
+            button("idle-exceptions", &exceptions, false, false, |s, tx| {
+                s.idle_exceptions_open = !s.idle_exceptions_open;
+                if s.idle_exceptions_open {
+                    tx.focus("idle-exception-search", true);
+                }
+            })
+            .expanded(s.idle_exceptions_open),
+        ),
+    );
+    if s.idle_exceptions_open {
+        idle = idle.child(idle_exception_picker(s));
+    }
+    if let Some(message) = &s.idle_exception_error {
+        idle = idle.child(empty_message(message));
+    }
     let input = el()
         .w(95.0)
         .h(44.0)
@@ -759,13 +1157,253 @@ fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
     if let Some(message) = &s.cutoff_notice {
         cutoff = cutoff.child(label(message, BODY, color(FOREST)).wrap());
     }
-    col()
-        .key("settings-content")
+    let sections = row().gap(6.0).flex_wrap().children(
+        [
+            ("settings-account", "Account", "sync-settings"),
+            ("settings-idle", "Idle detection", "idle-settings"),
+            ("settings-timetable", "Timetable", "cutoff"),
+            ("settings-apps", "Apps & groups", "aliases-content"),
+        ]
+        .into_iter()
+        .filter(|(_, _, target)| {
+            *target != "sync-settings" || s.sync.is_some() || s.sync_error.is_some()
+        })
+        .map(|(key, title, target)| {
+            button(key, title, false, false, move |_, tx| {
+                tx.scroll_key_to(target, 12.0)
+            })
+        }),
+    );
+    row().w_full().justify_center().child(
+        col()
+            .key("settings-content")
+            .w_full()
+            .max_w(920.0)
+            .gap(16.0)
+            .child(heading("Settings", 1))
+            .child(sections)
+            .children(sync_settings(s))
+            .child(idle)
+            .child(cutoff)
+            .child(aliases(s, compact, cx)),
+    )
+}
+
+fn sync_settings(s: &State) -> Option<El> {
+    let card = panel()
+        .key("sync-settings")
+        .child(heading("Account sync", 2));
+    if let Some(error) = &s.sync_error {
+        return Some(card.child(empty_message(error)));
+    }
+    let client = s.sync.as_ref()?;
+    let busy = client.is_busy();
+    let controls = row().gap(8.0).flex_wrap();
+    let mut card = if client.is_signed_in() {
+        card.child(
+            label(
+                format!("Signed in as {}", client.username.text),
+                BODY,
+                color(INK),
+            )
+            .wrap(),
+        )
+        .child(
+            controls
+                .child(button("sync-now", "Sync now", true, busy, |s, _| {
+                    if let Some(client) = &mut s.sync {
+                        client.sync_now();
+                    }
+                }))
+                .child(button("sync-logout", "Sign out", false, busy, |s, _| {
+                    s.logout_sync()
+                })),
+        )
+    } else {
+        let create = client.creating_account;
+        let (title, detail, action, alternate) = if create {
+            (
+                "Create an account",
+                "Use this account on each PC to see the same activity history.",
+                "Create account",
+                "Back to sign in",
+            )
+        } else {
+            (
+                "Sign in",
+                "Sign in with the same Molo account on each PC to see your combined activity.",
+                "Sign in",
+                "Create an account",
+            )
+        };
+        let username = text_input(&client.username, BODY)
+            .key("sync-username-input")
+            .label("Username")
+            .single_line()
+            .w_full()
+            .color(color(INK))
+            .on_edit(|s: &mut State| &mut s.sync.as_mut().unwrap().username)
+            .on_submit(|_: &mut State, tx| tx.focus("sync-password-input", true));
+        let mut form = col()
+            .w_full()
+            .max_w(460.0)
+            .gap(12.0)
+            .child(
+                label(title, TextStyle::new(20.0, 620.0), color(INK))
+                    .role("heading")
+                    .level(3),
+            )
+            .child(empty_message(detail))
+            .child(
+                col()
+                    .gap(5.0)
+                    .child(label("Username", BODY, color(INK)))
+                    .child(account_input().pr(12.0).child(username)),
+            )
+            .child(
+                col()
+                    .gap(5.0)
+                    .child(label("Password", BODY, color(INK)))
+                    .child(sync_password_field(client))
+                    .children(create.then(|| empty_message("Use at least 12 characters."))),
+            )
+            .child(
+                controls
+                    .child(button("sync-submit", action, true, busy, |s, _| {
+                        s.login_sync()
+                    }))
+                    .child(button(
+                        "sync-switch-mode",
+                        alternate,
+                        false,
+                        busy,
+                        |s, tx| {
+                            if let Some(client) = &mut s.sync {
+                                client.switch_auth_mode();
+                                tx.focus("sync-username-input", true);
+                            }
+                        },
+                    )),
+            );
+        if !client.status.is_empty() {
+            form = form.child(label(&client.status, BODY, color(FOREST)).wrap());
+        }
+        card.child(form).child(empty_message(
+            "Sync includes existing activity, browser titles, domains, groups, and tracking settings.",
+        ))
+    };
+    if client.is_signed_in() && !client.status.is_empty() {
+        card = card.child(label(&client.status, BODY, color(FOREST)).wrap());
+    }
+    Some(
+        card.child(separator()).child(
+            row()
+                .center_y()
+                .gap(8.0)
+                .child(label("Server", BODY, color(MUTED)))
+                .child(
+                    label(&client.server, BODY, color(INK))
+                        .min_w(0.0)
+                        .truncate()
+                        .help_when_truncated(&client.server),
+                ),
+        ),
+    )
+}
+
+fn account_input() -> El {
+    row()
         .w_full()
-        .gap(16.0)
-        .child(heading("Settings", 1))
-        .child(cutoff)
-        .child(aliases(s, compact, cx))
+        .h(46.0)
+        .pl(12.0)
+        .center_y()
+        .radius(8.0)
+        .fill(color(BASE))
+        .border(1.0, color(LINE))
+        .focus_within_ring(2.0, 1.0, color(FOREST))
+}
+
+fn sync_password_field(client: &crate::sync::Client) -> El {
+    let visible = client.password_visible;
+    let action = if visible {
+        "Hide password"
+    } else {
+        "Show password"
+    };
+    let ink = color(FOREST);
+    let mut eye = rune::Shape::new()
+        .stroke(
+            vec![
+                [2.0, 10.0],
+                [5.0, 6.5],
+                [8.0, 5.0],
+                [12.0, 5.0],
+                [15.0, 6.5],
+                [18.0, 10.0],
+                [15.0, 13.5],
+                [12.0, 15.0],
+                [8.0, 15.0],
+                [5.0, 13.5],
+                [2.0, 10.0],
+            ],
+            1.5,
+            ink,
+        )
+        .stroke(
+            vec![
+                [10.0, 7.5],
+                [12.0, 8.5],
+                [12.5, 10.0],
+                [12.0, 11.5],
+                [10.0, 12.5],
+                [8.0, 11.5],
+                [7.5, 10.0],
+                [8.0, 8.5],
+                [10.0, 7.5],
+            ],
+            1.4,
+            ink,
+        );
+    if visible {
+        eye = eye.line([3.0, 17.0], [17.0, 3.0], 1.5, rune::LineCap::Round, ink);
+    }
+    account_input()
+        .gap(6.0)
+        .child(
+            text_input(&client.password, BODY)
+                .key("sync-password-input")
+                .label("Password")
+                .single_line()
+                .secure()
+                .revealed(visible)
+                .min_w(0.0)
+                .grow(1.0)
+                .color(color(INK))
+                .on_edit(|s: &mut State| &mut s.sync.as_mut().unwrap().password)
+                .on_submit(|s: &mut State, _| s.login_sync()),
+        )
+        .child(
+            el().key("sync-password-visibility")
+                .size(44.0, 44.0)
+                .radius(7.0)
+                .center()
+                .role("button")
+                .label(action)
+                .help(action)
+                .focusable(true)
+                .focus_ring(2.0, -3.0, ink)
+                .hover(color(0xddebd6))
+                .on_press(|s: &mut State| {
+                    if let Some(client) = &mut s.sync {
+                        client.password_visible = !client.password_visible;
+                    }
+                })
+                .child(
+                    el().size(20.0, 20.0)
+                        .a11y_hidden()
+                        .shape(eye.view_box(20.0, 20.0)),
+                ),
+        )
 }
 
 fn comparison(total: i64, previous: i64, today: bool) -> String {
@@ -819,6 +1457,7 @@ fn timetable(s: &State, compact: bool) -> El {
     let matched: Vec<_> = visible
         .filter_map(|session| {
             if session.app.matches(&query)
+                || session.device.label().to_lowercase().contains(&query)
                 || time(session.start).contains(&query)
                 || time(session.end).contains(&query)
                 || duration(session.end - session.start).contains(&query)
@@ -851,15 +1490,22 @@ fn timetable(s: &State, compact: bool) -> El {
                 .child(label("DURATION", LABEL, color(MUTED)).w(68.0)),
         );
     }
+    let show_devices = s.sessions.iter().any(|session| !session.device.local);
     for (session, titles) in matched {
         log = log
             .child(separator())
-            .child(session_row(s, session, &titles, compact));
+            .child(session_row(s, session, &titles, compact, show_devices));
     }
     log
 }
 
-fn session_row(s: &State, session: &Session, matching_titles: &[&String], compact: bool) -> El {
+fn session_row(
+    s: &State,
+    session: &Session,
+    matching_titles: &[&String],
+    compact: bool,
+    show_devices: bool,
+) -> El {
     let id = session.id;
     let browser = session.app.id.browser_brand().is_some();
     let expanded = browser && s.expanded == Some(id);
@@ -876,6 +1522,23 @@ fn session_row(s: &State, session: &Session, matching_titles: &[&String], compac
         );
     if browser {
         app = app.child(label(if expanded { "⌄" } else { "›" }, BODY, color(MUTED)));
+    }
+    if show_devices {
+        let device = session.device.label();
+        app = app.child(
+            el().min_w(0.0)
+                .max_w(if compact { 126.0 } else { 178.0 })
+                .px(6.0)
+                .py(3.0)
+                .radius(5.0)
+                .fill(color(BASE))
+                .child(
+                    label(&device, TextStyle::new(11.0, 560.0), color(FOREST))
+                        .min_w(0.0)
+                        .truncate()
+                        .help_when_truncated(&device),
+                ),
+        );
     }
     let time_row = row()
         .center_y()
@@ -1147,7 +1810,13 @@ fn pause_control(s: &State) -> El {
                 .child(icon),
         )
         .child(label(
-            if s.paused { "Paused" } else { "Tracking" },
+            if s.paused {
+                "Paused"
+            } else if s.idle {
+                "Idle"
+            } else {
+                "Tracking"
+            },
             BODY,
             color(MUTED),
         ))

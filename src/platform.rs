@@ -102,19 +102,81 @@ fn window_app(window: HWND) -> Option<AppId> {
     })
 }
 
-pub fn foreground() -> Option<FocusedApp> {
+pub fn idle_ms() -> Option<u32> {
     let mut input = LASTINPUTINFO {
         cbSize: size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
-    let idle = unsafe {
-        GetLastInputInfo(&mut input) != 0 && GetTickCount().wrapping_sub(input.dwTime) >= 300_000
-    };
-    if idle {
-        return None;
+    unsafe {
+        (GetLastInputInfo(&mut input) != 0).then(|| GetTickCount().wrapping_sub(input.dwTime))
     }
+}
+
+pub fn protect(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    protect_data(bytes, true)
+}
+
+pub fn unprotect(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    protect_data(bytes, false)
+}
+
+fn protect_data(bytes: &[u8], encrypt: bool) -> io::Result<Vec<u8>> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(bytes.len()).map_err(io::Error::other)?,
+        pbData: bytes.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+    // With no machine flag, Windows encrypts this token for the current Windows user.
+    unsafe {
+        let ok = if encrypt {
+            CryptProtectData(
+                &input,
+                null(),
+                null(),
+                null(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                null_mut(),
+                null(),
+                null(),
+                null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let data = if output.cbData == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+        };
+        LocalFree(output.pbData.cast());
+        Ok(data)
+    }
+}
+
+pub fn foreground(should_track: impl FnOnce(&AppId) -> bool) -> Option<FocusedApp> {
     let window = unsafe { GetForegroundWindow() };
     let app = window_app(window)?;
+    if !should_track(&app) {
+        return None;
+    }
     let (page_title, browser) = app.browser_brand().map_or((None, None), |brand| {
         let caption = window_caption(window);
         (
