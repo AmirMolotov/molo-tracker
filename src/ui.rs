@@ -27,6 +27,8 @@ const BODY: TextStyle = TextStyle::new(14.0, 450.0);
 const LABEL: TextStyle = TextStyle::new(11.0, 620.0).mono().tracking(0.7);
 const TIME: TextStyle = TextStyle::new(13.0, 500.0).mono();
 const TITLE: TextStyle = TextStyle::new(27.0, 560.0).tracking(-0.9);
+const SETTINGS_WIDTH: f32 = 920.0;
+const SETTINGS_SECTION_INSET: f32 = 12.0;
 
 fn color(rgb: u32) -> Color {
     let channel = |shift: u32| rune::theme::srgb_decode(((rgb >> shift) & 255) as f32 / 255.0);
@@ -1157,36 +1159,74 @@ fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
     if let Some(message) = &s.cutoff_notice {
         cutoff = cutoff.child(label(message, BODY, color(FOREST)).wrap());
     }
-    let sections = row().gap(6.0).flex_wrap().children(
-        [
-            ("settings-account", "Account", "sync-settings"),
-            ("settings-idle", "Idle detection", "idle-settings"),
-            ("settings-timetable", "Timetable", "cutoff"),
-            ("settings-apps", "Apps & groups", "aliases-content"),
-        ]
-        .into_iter()
-        .filter(|(_, _, target)| {
-            *target != "sync-settings" || s.sync.is_some() || s.sync_error.is_some()
-        })
-        .map(|(key, title, target)| {
-            button(key, title, false, false, move |_, tx| {
-                tx.scroll_key_to(target, 12.0)
-            })
-        }),
-    );
+    // Leave enough scrolling room for the last section to reach the same starting line.
+    let last_section_height = cx.layout_size("page").map_or(0.0, |[_, height]| {
+        (height - SETTINGS_SECTION_INSET - 20.0).max(0.0)
+    });
     row().w_full().justify_center().child(
         col()
             .key("settings-content")
             .w_full()
-            .max_w(920.0)
+            .max_w(SETTINGS_WIDTH)
             .gap(16.0)
             .child(heading("Settings", 1))
-            .child(sections)
             .children(sync_settings(s))
             .child(idle)
             .child(cutoff)
-            .child(aliases(s, compact, cx)),
+            .child(aliases(s, compact, cx).min_h(last_section_height)),
     )
+}
+
+fn settings_navigation(s: &State, cx: &Cx<State>, compact: bool, inset: f32) -> El {
+    let sections: Vec<_> = [
+        ("settings-account", "Account", "sync-settings"),
+        ("settings-idle", "Idle detection", "idle-settings"),
+        ("settings-timetable", "Timetable", "cutoff"),
+        ("settings-apps", "Apps & groups", "aliases-content"),
+    ]
+    .into_iter()
+    .filter(|(_, _, target)| {
+        *target != "sync-settings" || s.sync.is_some() || s.sync_error.is_some()
+    })
+    .collect();
+    let reading_line = cx.layout_with("page", |rect| rect[1]).unwrap_or(0.0) + 32.0;
+    let mut active = sections[0].2;
+    for &(_, _, target) in &sections {
+        if cx
+            .window_layout_with(target, move |rect| rect[1] <= reading_line)
+            .unwrap_or(false)
+        {
+            active = target;
+        }
+    }
+    let links = row()
+        .w_full()
+        .max_w(SETTINGS_WIDTH)
+        .gap(if compact { 4.0 } else { 6.0 })
+        .role("navigation")
+        .label("Settings sections")
+        .flex_wrap()
+        .children(sections.into_iter().map(|(key, title, target)| {
+            let selected = active == target;
+            button(key, title, selected, false, move |_, tx| {
+                tx.scroll_key_to(target, SETTINGS_SECTION_INSET);
+            })
+            .checked(selected)
+            .px(if compact { 4.0 } else { 13.0 })
+        }));
+    col()
+        .key("settings-navigation")
+        .w_full()
+        .fill(color(SURFACE))
+        .child(
+            row()
+                .w_full()
+                .px(inset)
+                .py(7.0)
+                .justify_center()
+                .child(links),
+        )
+        .child(separator())
 }
 
 fn sync_settings(s: &State) -> Option<El> {
@@ -1909,6 +1949,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(navigation),
         )
         .child(separator())
+        .children(
+            (s.screen == Screen::Settings).then(|| settings_navigation(s, cx, compact, inset)),
+        )
         .child(
             col()
                 .key("page")
