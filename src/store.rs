@@ -7,8 +7,10 @@ use crate::platform::AppId;
 
 mod coverage;
 mod preferences;
+mod reporting;
 mod sync;
 pub(crate) use coverage::covered;
+pub(crate) use reporting::AppTotals;
 
 pub const DEFAULT_IDLE_SECONDS: u32 = 300;
 
@@ -111,12 +113,6 @@ pub struct BrowserPage {
     pub end: i64,
 }
 
-pub struct WebsiteTime {
-    pub domain: String,
-    pub chrome: i64,
-    pub firefox: i64,
-}
-
 pub struct Store(Connection);
 
 impl Store {
@@ -155,6 +151,9 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS website_focus_end ON website_focus(end);
              CREATE INDEX IF NOT EXISTS website_focus_session_end ON website_focus(session_id, end);
+             CREATE TABLE IF NOT EXISTS website_groups (
+                 domain TEXT PRIMARY KEY, name TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS settings (
                  id INTEGER PRIMARY KEY CHECK(id = 1),
                  cutoff INTEGER NOT NULL
@@ -272,8 +271,10 @@ impl Store {
     }
 
     fn folder_names(db: &Connection) -> rusqlite::Result<Vec<String>> {
-        let mut query =
-            db.prepare("SELECT name FROM group_folders UNION SELECT name FROM app_groups")?;
+        let mut query = db.prepare(
+            "SELECT name FROM group_folders UNION SELECT name FROM app_groups
+             UNION SELECT name FROM website_groups",
+        )?;
         query.query_map([], |row| row.get(0))?.collect()
     }
 
@@ -295,8 +296,13 @@ impl Store {
                     "UPDATE app_groups SET name = ?2 WHERE name = ?1",
                     params![name, new_name],
                 )?;
+                tx.execute(
+                    "UPDATE website_groups SET name = ?2 WHERE name = ?1",
+                    params![name, new_name],
+                )?;
             } else {
                 tx.execute("DELETE FROM app_groups WHERE name = ?1", [name])?;
+                tx.execute("DELETE FROM website_groups WHERE name = ?1", [name])?;
             }
         }
         if let Some(name) = new_name {
@@ -329,38 +335,6 @@ impl Store {
             }
         }
         tx.commit()
-    }
-
-    pub fn usage(
-        &self,
-        start: NaiveDate,
-        end: NaiveDate,
-        device: Option<&str>,
-    ) -> rusqlite::Result<Vec<(Application, Usage)>> {
-        let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
-            return Ok(Vec::new());
-        };
-        let sessions = self.range(start, end, device)?;
-        let mut apps = BTreeMap::new();
-        let mut counted = BTreeSet::new();
-        for part in covered(&sessions) {
-            let session = part.session;
-            let (_, usage) = apps
-                .entry(&session.app.id.key)
-                .or_insert_with(|| (session.app.clone(), Usage::default()));
-            usage.time += part.end - part.start;
-            if session.original_start >= start && counted.insert(session.id) {
-                usage.sessions += 1;
-            }
-        }
-        Ok(apps.into_values().collect())
-    }
-
-    pub fn devices(&self, start: NaiveDate, end: NaiveDate) -> rusqlite::Result<Vec<DeviceUsage>> {
-        let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
-            return Ok(Vec::new());
-        };
-        Ok(coverage::device_usage(&self.range(start, end, None)?))
     }
 
     pub fn report_devices(&self) -> rusqlite::Result<Vec<Device>> {
@@ -444,62 +418,6 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
-    }
-
-    pub fn website_time(
-        &self,
-        start: NaiveDate,
-        end: NaiveDate,
-        device: Option<&str>,
-    ) -> rusqlite::Result<Vec<WebsiteTime>> {
-        let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
-            return Ok(Vec::new());
-        };
-        let sessions = self.range(start, end, device)?;
-        let mut intervals = BTreeMap::<i64, Vec<(i64, i64)>>::new();
-        for part in covered(&sessions) {
-            intervals
-                .entry(part.session.id)
-                .or_default()
-                .push((part.start, part.end));
-        }
-        let mut query = self.0.prepare(
-            "SELECT website_focus.session_id, website_focus.domain, website_focus.start,
-                    website_focus.end, lower(apps.name)
-             FROM website_focus JOIN sessions ON sessions.id = website_focus.session_id
-             JOIN apps ON apps.path = sessions.app
-             WHERE website_focus.end > ?1 AND website_focus.start < ?2",
-        )?;
-        let mut rows = query.query(params![start, end])?;
-        let mut domains = BTreeMap::new();
-        while let Some(row) = rows.next()? {
-            let Some(parts) = intervals.get(&row.get::<_, i64>(0)?) else {
-                continue;
-            };
-            let domain: String = row.get(1)?;
-            let start: i64 = row.get(2)?;
-            let end: i64 = row.get(3)?;
-            let first = parts.partition_point(|&(_, stop)| stop <= start);
-            let time: i64 = parts[first..]
-                .iter()
-                .take_while(|&&(begin, _)| begin < end)
-                .map(|&(begin, stop)| stop.min(end) - begin.max(start))
-                .sum();
-            if time == 0 {
-                continue;
-            }
-            let usage = domains.entry(domain.clone()).or_insert(WebsiteTime {
-                domain,
-                chrome: 0,
-                firefox: 0,
-            });
-            match row.get::<_, String>(4)?.as_str() {
-                "chrome" => usage.chrome += time,
-                "firefox" => usage.firefox += time,
-                _ => {}
-            }
-        }
-        Ok(domains.into_values().collect())
     }
 
     pub fn pages(&self, session: &Session) -> rusqlite::Result<Vec<BrowserPage>> {

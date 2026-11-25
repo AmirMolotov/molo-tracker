@@ -175,6 +175,8 @@ struct State {
     report_websites: bool,
     report_app_search: TextEdit,
     report_website_search: TextEdit,
+    website_group_domain: Option<String>,
+    website_group_input: TextEdit,
     notice: Option<String>,
     tracking_error: Option<String>,
 }
@@ -266,6 +268,8 @@ impl State {
             report_websites: false,
             report_app_search: TextEdit::new(""),
             report_website_search: TextEdit::new(""),
+            website_group_domain: None,
+            website_group_input: TextEdit::new(""),
             notice: None,
             tracking_error: None,
         };
@@ -411,6 +415,7 @@ impl State {
             Ok((report, devices, device)) => {
                 if self.report_device != device {
                     self.report_group = None;
+                    self.website_group_domain = None;
                 }
                 self.report = report;
                 self.report_devices = devices;
@@ -429,7 +434,29 @@ impl State {
                 date
             };
             self.report_group = None;
+            self.website_group_domain = None;
             self.refresh_report();
+        }
+    }
+
+    fn save_website_group(&mut self) {
+        let Some(domain) = &self.website_group_domain else {
+            return;
+        };
+        let name = self.website_group_input.text.trim();
+        if !valid_folder_name(name) {
+            self.notice = Some(
+                "Use up to 64 characters on one line. Leave the group blank to remove it.".into(),
+            );
+            return;
+        }
+        match self.store.save_website_group(domain, name) {
+            Ok(()) => {
+                self.website_group_domain = None;
+                self.notice = None;
+                self.refresh_report();
+            }
+            Err(error) => self.notice = Some(format!("Could not save the website group. {error}")),
         }
     }
 
@@ -648,7 +675,7 @@ impl State {
                     self.report_group = self.folder.clone();
                 }
                 self.folder_notice = Some(if delete {
-                    "Group deleted. Its apps are now Ungrouped.".into()
+                    "Group deleted. Its apps and websites were removed from it.".into()
                 } else {
                     format!("Group renamed to {name}.")
                 });

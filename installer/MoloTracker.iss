@@ -27,8 +27,12 @@ Source: "..\target\release\molo-tracker.exe"; DestDir: "{app}"; Flags: ignorever
 Source: "Terms.txt"; DestDir: "{app}"
 Source: "..\assets\fonts\*-OFL.txt"; DestDir: "{app}\licenses"
 
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+
 [Icons]
 Name: "{userprograms}\Molo Tracker"; Filename: "{app}\molo-tracker.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\Molo Tracker"; Filename: "{app}\molo-tracker.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\molo-tracker.exe"; Description: "Launch Molo Tracker"; Flags: nowait postinstall skipifsilent unchecked

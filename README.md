@@ -4,7 +4,7 @@ Molo is a Windows desktop app for reviewing your foreground app usage. Its inter
 
 ## Install on Windows
 
-Download the x64 setup executable from [GitHub Releases](https://github.com/AmirMolotov/molo-tracker/releases/latest). Quit any running copy of Molo from the notification area before running Setup. Accept the [Terms of Use](installer/Terms.txt) and choose an install folder. Setup installs Molo for your Windows account and adds a Start menu shortcut.
+Download the x64 setup executable from [GitHub Releases](https://github.com/AmirMolotov/molo-tracker/releases/latest). Quit any running copy of Molo from the notification area before running Setup. Accept the [Terms of Use](installer/Terms.txt) and choose an install folder. Setup adds a Start menu shortcut. To add one to your desktop, select **Create a desktop shortcut**.
 
 To uninstall, quit Molo from the notification area, then open **Settings → Apps → Installed apps** and choose **Uninstall** for **Molo Tracker**. Activity and settings remain in `%LOCALAPPDATA%\Molo Tracker`.
 
@@ -39,6 +39,8 @@ In **Settings → App aliases and groups**, create a group such as **Games**. Ct
 When activity from another PC is available, choose a PC under **Device** to filter the charts, website report, and previous-period comparison. Choose **All devices** to return to the combined report.
 
 **Reports → Websites** groups recorded Chrome and Firefox focus time by main domain. Subdomains such as `news.bbc.co.uk` are combined under `bbc.co.uk`. The report lists each browser’s time, the combined total, and the change from the previous period. Molo reads the current browser address through Windows accessibility and saves only the domain for this report. This starts with new activity, and browser time still counts in the app and group reports when a domain cannot be read.
+
+In **Reports → Websites**, choose **Set group** next to a domain. Use the same group name as an app to see both in the **Overview** group breakdown. Molo attributes recorded time on assigned websites to their group, and the browser still shows its full time in the app comparison. Website assignments apply to existing recordings and are saved on the PC where you set them.
 
 Select a group in Settings to see its apps and use **Rename group** or **Delete group**. Deleting a group moves its apps to **Ungrouped** and keeps their activity history. The pie chart shows each group’s share of focus time. Select a group in the legend to see its apps. Report totals include all recorded sessions and take their time from the selected dates.
 

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{Datelike, Days, Months, NaiveDate};
 
-use crate::store::{Application, Store, Usage};
+use crate::store::{AppTotals, Application, Store, Usage};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Period {
@@ -78,6 +78,7 @@ pub struct Report {
 #[derive(Default)]
 pub struct WebsiteUsage {
     pub domain: String,
+    pub group: Option<String>,
     pub chrome: i64,
     pub firefox: i64,
     pub previous: i64,
@@ -101,6 +102,17 @@ pub struct GroupUsage {
     pub name: String,
     pub current: Usage,
     pub previous: Usage,
+    pub apps: Vec<AppUsage>,
+}
+
+impl GroupUsage {
+    fn new(name: Option<&str>) -> Self {
+        Self {
+            key: name.map_or_else(String::new, str::to_lowercase),
+            name: name.unwrap_or("Ungrouped").into(),
+            ..Self::default()
+        }
+    }
 }
 
 impl Usage {
@@ -123,53 +135,61 @@ impl Report {
         else {
             return Ok(Self::default());
         };
-        let mut by_app = BTreeMap::new();
-        for (app, usage) in store.usage(previous, start, device)? {
-            by_app.insert(
-                app.id.key.clone(),
-                AppUsage {
-                    app,
-                    current: Usage::default(),
-                    previous: usage,
-                },
-            );
-        }
-        for (app, usage) in store.usage(start, end, device)? {
-            by_app
-                .entry(app.id.key.clone())
-                .or_insert(AppUsage {
-                    app,
-                    current: Usage::default(),
-                    previous: Usage::default(),
-                })
-                .current = usage;
-        }
-
-        let mut result = Self::default();
-        if device.is_none() {
-            result.devices = store.devices(start, end)?;
-        }
-        let mut groups = BTreeMap::new();
-        for app in by_app.into_values() {
-            let key = group_key(&app.app);
-            let group = groups.entry(key.clone()).or_insert_with(|| GroupUsage {
-                key,
-                name: app.app.group.clone().unwrap_or_else(|| "Ungrouped".into()),
-                ..GroupUsage::default()
-            });
-            group.current.accumulate(app.current);
-            group.previous.accumulate(app.previous);
+        let prior = store.report_usage(previous, start, device, false)?;
+        let current = store.report_usage(start, end, device, device.is_none())?;
+        let mut result = Self {
+            apps: compare_apps(current.apps, prior.apps),
+            devices: current.devices,
+            ..Self::default()
+        };
+        for app in &result.apps {
             result.total.accumulate(app.current);
             result.previous.accumulate(app.previous);
-            result.apps.push(app);
         }
-        result.apps.sort_by(|a, b| {
-            b.current
-                .time
-                .cmp(&a.current.time)
-                .then_with(|| b.previous.time.cmp(&a.previous.time))
-                .then_with(|| a.app.label().cmp(b.app.label()))
-        });
+
+        let mut groups = BTreeMap::new();
+        let mut prior_apps = prior.grouped_apps;
+        for (key, apps) in current.grouped_apps {
+            let previous = prior_apps.remove(&key).unwrap_or_default();
+            insert_app_group(&mut groups, compare_apps(apps, previous));
+        }
+        for apps in prior_apps.into_values() {
+            insert_app_group(&mut groups, compare_apps(AppTotals::new(), apps));
+        }
+
+        let mut domains = BTreeMap::new();
+        for (period, is_current) in [(prior.websites, false), (current.websites, true)] {
+            for (domain, data) in period {
+                let time = data.chrome + data.firefox;
+                if let Some(name) = &data.group {
+                    let group = groups
+                        .entry(name.to_lowercase())
+                        .or_insert_with(|| GroupUsage::new(Some(name)));
+                    let usage = if is_current {
+                        &mut group.current
+                    } else {
+                        &mut group.previous
+                    };
+                    usage.accumulate(Usage {
+                        time,
+                        sessions: data.sessions,
+                    });
+                }
+                let website = domains
+                    .entry(domain.clone())
+                    .or_insert_with(|| WebsiteUsage {
+                        domain,
+                        group: data.group,
+                        ..WebsiteUsage::default()
+                    });
+                if is_current {
+                    website.chrome = data.chrome;
+                    website.firefox = data.firefox;
+                } else {
+                    website.previous = time;
+                }
+            }
+        }
         result.groups = groups.into_values().collect();
         result.groups.sort_by(|a, b| {
             b.current
@@ -177,27 +197,6 @@ impl Report {
                 .cmp(&a.current.time)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        let mut domains = BTreeMap::new();
-        for data in store.website_time(previous, start, device)? {
-            domains.insert(
-                data.domain.clone(),
-                WebsiteUsage {
-                    domain: data.domain,
-                    previous: data.chrome + data.firefox,
-                    ..WebsiteUsage::default()
-                },
-            );
-        }
-        for data in store.website_time(start, end, device)? {
-            let website = domains
-                .entry(data.domain.clone())
-                .or_insert_with(|| WebsiteUsage {
-                    domain: data.domain,
-                    ..WebsiteUsage::default()
-                });
-            website.chrome = data.chrome;
-            website.firefox = data.firefox;
-        }
         result.websites = domains.into_values().collect();
         result.websites.sort_by(|a, b| {
             b.total()
@@ -207,6 +206,49 @@ impl Report {
         });
         Ok(result)
     }
+}
+
+fn compare_apps(current: AppTotals, previous: AppTotals) -> Vec<AppUsage> {
+    let mut by_app = BTreeMap::new();
+    for (key, (app, usage)) in previous {
+        by_app.insert(
+            key,
+            AppUsage {
+                app,
+                current: Usage::default(),
+                previous: usage,
+            },
+        );
+    }
+    for (key, (app, usage)) in current {
+        by_app
+            .entry(key)
+            .or_insert(AppUsage {
+                app,
+                current: Usage::default(),
+                previous: Usage::default(),
+            })
+            .current = usage;
+    }
+    let mut apps: Vec<_> = by_app.into_values().collect();
+    apps.sort_by(|a, b| {
+        b.current
+            .time
+            .cmp(&a.current.time)
+            .then_with(|| b.previous.time.cmp(&a.previous.time))
+            .then_with(|| a.app.label().cmp(b.app.label()))
+    });
+    apps
+}
+
+fn insert_app_group(groups: &mut BTreeMap<String, GroupUsage>, apps: Vec<AppUsage>) {
+    let mut group = GroupUsage::new(apps.first().and_then(|app| app.app.group.as_deref()));
+    for app in &apps {
+        group.current.accumulate(app.current);
+        group.previous.accumulate(app.previous);
+    }
+    group.apps = apps;
+    groups.insert(group.key.clone(), group);
 }
 
 pub fn group_key(app: &Application) -> String {
@@ -223,6 +265,95 @@ mod tests {
 
     use super::*;
     use crate::platform::AppId;
+
+    #[test]
+    fn website_and_app_time_share_groups_without_counting_browser_time_twice() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let noon = Local
+            .from_local_datetime(&day.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let app = |name: &str| AppId {
+            key: name.into(),
+            name: name.into(),
+        };
+        let browser = app("chrome");
+        let editor = app("Editor");
+        let session = store
+            .record(
+                &browser,
+                noon,
+                noon + 2000,
+                None,
+                None,
+                Some("work.example"),
+            )
+            .unwrap();
+        store
+            .record(
+                &browser,
+                noon + 2000,
+                noon + 5000,
+                Some(session),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .record(&editor, noon + 5000, noon + 9000, None, None, None)
+            .unwrap();
+        store.save_groups(&[editor], "Work").unwrap();
+        store.save_groups(&[browser], "Browsing").unwrap();
+        store.save_website_group("work.example", "work").unwrap();
+
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!((report.total.time, report.total.sessions), (9000, 2));
+        assert_eq!(
+            (
+                report.groups[0].name.as_str(),
+                report.groups[0].current.time,
+                report.groups[0].current.sessions
+            ),
+            ("Work", 6000, 2)
+        );
+        assert_eq!(report.groups[0].apps[0].app.label(), "Editor");
+        assert_eq!(
+            (
+                report.groups[1].name.as_str(),
+                report.groups[1].current.time,
+                report.groups[1].current.sessions
+            ),
+            ("Browsing", 3000, 0)
+        );
+        assert_eq!(
+            report
+                .apps
+                .iter()
+                .find(|app| app.app.label() == "chrome")
+                .unwrap()
+                .current
+                .time,
+            5000
+        );
+        assert_eq!(report.websites[0].group.as_deref(), Some("Work"));
+
+        assert!(store.change_folder("work", Some("Projects")).unwrap());
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!(report.websites[0].group.as_deref(), Some("Projects"));
+        assert_eq!(report.groups[0].name, "Projects");
+        assert!(store.change_folder("projects", None).unwrap());
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert!(report.websites[0].group.is_none());
+        assert_eq!(
+            (
+                report.groups[0].name.as_str(),
+                report.groups[0].current.time
+            ),
+            ("Browsing", 5000)
+        );
+    }
 
     #[test]
     fn report_groups_time_and_compares_sessions_across_midnight() {

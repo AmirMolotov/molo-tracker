@@ -13,10 +13,7 @@ pub(super) fn view(s: &State, compact: bool) -> El {
     let current = period.start(s.today);
     let dates = report::date_range(start, end.min(s.today.succ_opt().unwrap()));
     let baseline = if period == Period::Daily && s.report_date == s.today {
-        format!(
-            "Compared with yesterday · {}",
-            report::date_range(previous, start)
-        )
+        "Compared with yesterday".into()
     } else {
         format!("Compared with {}", report::date_range(previous, start))
     };
@@ -30,67 +27,93 @@ pub(super) fn view(s: &State, compact: bool) -> El {
             button(key, option.label(), period == option, false, move |s, _| {
                 s.report_period = option;
                 s.report_group = None;
+                s.website_group_domain = None;
                 s.refresh_report();
             })
+            .checked(period == option)
         }),
     );
     let navigation = row()
-        .gap(6.0)
-        .flex_wrap()
-        .child(button(
-            "report-prev",
-            "Previous",
-            false,
-            start <= period.start(s.first),
-            |s, _| s.step_report(false),
-        ))
-        .child(button(
-            "report-current",
-            "Current",
-            false,
-            start == current,
-            |s, _| {
-                s.report_date = s.today;
-                s.report_group = None;
-                s.refresh_report();
-            },
-        ))
-        .child(button(
-            "report-next",
-            "Next",
-            false,
-            start >= current,
-            |s, _| s.step_report(true),
-        ));
-    let controls = if compact {
-        col().gap(8.0)
-    } else {
-        row().center_y().gap(8.0)
+        .gap(10.0)
+        .center_y()
+        .min_w(0.0)
+        .child(period_arrow(false, start <= period.start(s.first)))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(
+                    label(dates, TextStyle::new(18.0, 620.0), color(INK))
+                        .align(rune::Align::Center)
+                        .wrap(),
+                )
+                .child(
+                    label(baseline, BODY, color(MUTED))
+                        .align(rune::Align::Center)
+                        .wrap(),
+                ),
+        )
+        .child(period_arrow(true, start >= current));
+    let jump_label = match period {
+        Period::Daily => "Today",
+        Period::Weekly => "This week",
+        Period::Monthly => "This month",
     };
-    let controls = controls
-        .child(el().grow(1.0).child(switch))
-        .child(navigation);
+    let period_controls = switch.children((start < current).then(|| {
+        button("report-current", jump_label, false, false, |s, _| {
+            s.report_date = s.today;
+            s.report_group = None;
+            s.website_group_domain = None;
+            s.refresh_report();
+        })
+    }));
+    let controls = if compact {
+        col().gap(12.0).child(period_controls).child(navigation)
+    } else {
+        row()
+            .center_y()
+            .gap(16.0)
+            .child(
+                el().grow(1.0)
+                    .min_w(0.0)
+                    .child(navigation.w_full().max_w(400.0)),
+            )
+            .child(period_controls)
+    };
+    let filters = panel()
+        .key("report-filters")
+        .padding(if compact { 14.0 } else { 18.0 })
+        .child(controls)
+        .children((s.report_devices.len() > 1).then(separator))
+        .children((s.report_devices.len() > 1).then(|| device_filter(s)));
     let report_views = row()
         .gap(6.0)
         .flex_wrap()
-        .child(button(
-            "reports-apps-view",
-            "Apps and groups",
-            !s.report_websites,
-            false,
-            |s, _| {
-                s.report_websites = false;
-            },
-        ))
-        .child(button(
-            "reports-websites-view",
-            "Websites",
-            s.report_websites,
-            false,
-            |s, _| {
-                s.report_websites = true;
-            },
-        ));
+        .child(
+            button(
+                "reports-apps-view",
+                "Overview",
+                !s.report_websites,
+                false,
+                |s, _| {
+                    s.report_websites = false;
+                },
+            )
+            .checked(!s.report_websites),
+        )
+        .child(
+            button(
+                "reports-websites-view",
+                "Websites",
+                s.report_websites,
+                false,
+                |s, _| {
+                    s.report_websites = true;
+                },
+            )
+            .checked(s.report_websites),
+        );
 
     let total = s.report.total;
     let prior = s.report.previous;
@@ -123,15 +146,8 @@ pub(super) fn view(s: &State, compact: bool) -> El {
         .key("reports-content")
         .w_full()
         .gap(16.0)
-        .child(
-            col()
-                .gap(3.0)
-                .child(heading("Reports", 1))
-                .child(label(dates, BODY, color(INK)).wrap())
-                .child(label(baseline, BODY, color(MUTED)).wrap()),
-        )
-        .child(controls)
-        .children((s.report_devices.len() > 1).then(|| device_filter(s)))
+        .child(heading("Reports", 1))
+        .child(filters)
         .child(report_views);
     if s.report_websites {
         report.child(websites(s, compact))
@@ -142,6 +158,30 @@ pub(super) fn view(s: &State, compact: bool) -> El {
             .child(groups(s, compact))
             .child(apps(s, compact))
     }
+}
+
+fn period_arrow(next: bool, disabled: bool) -> El {
+    let (key, name) = if next {
+        ("report-next", "Next period")
+    } else {
+        ("report-prev", "Previous period")
+    };
+    let points = if next {
+        vec![[5.0, 3.0], [10.0, 8.0], [5.0, 13.0]]
+    } else {
+        vec![[10.0, 3.0], [5.0, 8.0], [10.0, 13.0]]
+    };
+    button(key, "", false, disabled, move |s, _| s.step_report(next))
+        .size(44.0, 44.0)
+        .px(0.0)
+        .label(name)
+        .child(
+            el().size(16.0, 16.0).shape(
+                Shape::new()
+                    .stroke(points, 1.8, color(INK))
+                    .view_box(16.0, 16.0),
+            ),
+        )
 }
 
 fn device_filter(s: &State) -> El {
@@ -218,7 +258,7 @@ fn websites(s: &State, compact: bool) -> El {
         .child(
             search_field(
                 "report-website-search",
-                "Search domains",
+                "Search domains or groups",
                 &s.report_website_search,
                 |s| &mut s.report_website_search,
             )
@@ -245,9 +285,13 @@ fn websites(s: &State, compact: bool) -> El {
             )),
     );
     let query = search_query(&s.report_website_search);
-    let matching = domains
-        .iter()
-        .filter(|site| site.domain.to_lowercase().contains(&query));
+    let matching = domains.iter().filter(|site| {
+        site.domain.to_lowercase().contains(&query)
+            || site
+                .group
+                .as_ref()
+                .is_some_and(|group| group.to_lowercase().contains(&query))
+    });
     if matching.clone().next().is_none() {
         return card.child(empty_message("No matching domains."));
     }
@@ -256,12 +300,30 @@ fn websites(s: &State, compact: bool) -> El {
             row()
                 .gap(10.0)
                 .child(label("DOMAIN", LABEL, color(MUTED)).min_w(0.0).grow(1.0))
+                .child(label("GROUP", LABEL, color(MUTED)).w(128.0))
                 .child(label("CHROME", LABEL, color(MUTED)).w(94.0))
                 .child(label("FIREFOX", LABEL, color(MUTED)).w(94.0))
                 .child(label("TOTAL / CHANGE", LABEL, color(MUTED)).w(190.0)),
         );
     }
     for site in matching {
+        let editing = s.website_group_domain.as_ref() == Some(&site.domain);
+        let domain_key = site.domain.clone();
+        let group_name = site.group.clone();
+        let group = button(
+            &format!("website-group:{}", site.domain),
+            site.group.as_deref().unwrap_or("Set group"),
+            editing,
+            false,
+            move |s, tx| {
+                s.website_group_domain = Some(domain_key.clone());
+                s.website_group_input = TextEdit::new(group_name.as_deref().unwrap_or(""));
+                s.notice = None;
+                tx.focus("website-group-input", true);
+            },
+        )
+        .w(128.0)
+        .label(format!("Edit group for {}", site.domain));
         let time = format!(
             "{}  ({})",
             duration(site.total()),
@@ -273,34 +335,140 @@ fn websites(s: &State, compact: bool) -> El {
             .truncate()
             .help_when_truncated(&site.domain);
         let entry = if compact {
-            col().gap(5.0).child(domain).child(
-                label(
-                    format!(
-                        "{}  ·  Chrome {}  /  Firefox {}",
-                        time,
-                        duration(site.chrome),
-                        duration(site.firefox)
-                    ),
-                    TIME,
-                    color(MUTED),
+            col()
+                .gap(5.0)
+                .child(row().gap(8.0).center_y().child(domain).child(group))
+                .child(
+                    label(
+                        format!(
+                            "{}  ·  Chrome {}  /  Firefox {}",
+                            time,
+                            duration(site.chrome),
+                            duration(site.firefox)
+                        ),
+                        TIME,
+                        color(MUTED),
+                    )
+                    .wrap(),
                 )
-                .wrap(),
-            )
         } else {
             row()
                 .center_y()
                 .gap(10.0)
                 .min_h(34.0)
                 .child(domain)
+                .child(group)
                 .child(label(duration(site.chrome), TIME, color(MUTED)).w(94.0))
                 .child(label(duration(site.firefox), TIME, color(MUTED)).w(94.0))
                 .child(label(time, TIME, color(INK)).w(190.0))
         };
         card = card
             .child(separator())
-            .child(entry.key(format!("domain:{}", site.domain)));
+            .child(entry.key(format!("domain:{}", site.domain)))
+            .children(editing.then(|| website_group_editor(s)));
     }
     card
+}
+
+fn website_group_editor(s: &State) -> El {
+    col()
+        .gap(8.0)
+        .padding(12.0)
+        .radius(8.0)
+        .fill(color(BASE))
+        .child(
+            label(
+                "Use an existing group name or enter a new one. Leave blank to clear.",
+                BODY,
+                color(MUTED),
+            )
+            .wrap(),
+        )
+        .child(
+            el().w_full()
+                .max_w(420.0)
+                .h(44.0)
+                .px(10.0)
+                .center_y()
+                .radius(8.0)
+                .border(1.0, color(LINE))
+                .fill(color(SURFACE))
+                .child(
+                    text_input(&s.website_group_input, BODY)
+                        .key("website-group-input")
+                        .label("Group name")
+                        .single_line()
+                        .color(color(INK))
+                        .w_full()
+                        .on_edit(|s: &mut State| &mut s.website_group_input)
+                        .on_submit(|s: &mut State, _| s.save_website_group()),
+                ),
+        )
+        .child(
+            row()
+                .gap(8.0)
+                .flex_wrap()
+                .child(button(
+                    "save-website-group",
+                    "Save group",
+                    true,
+                    false,
+                    |s, _| s.save_website_group(),
+                ))
+                .child(button(
+                    "cancel-website-group",
+                    "Cancel",
+                    false,
+                    false,
+                    |s, _| {
+                        s.website_group_domain = None;
+                        s.notice = None;
+                    },
+                )),
+        )
+}
+
+fn group_websites(s: &State) -> Option<El> {
+    let group = s
+        .report
+        .groups
+        .iter()
+        .find(|group| Some(&group.key) == s.report_group.as_ref())?;
+    let sites = s.report.websites.iter().filter(|site| {
+        site.group
+            .as_ref()
+            .is_some_and(|name| name.to_lowercase() == group.key)
+    });
+    if sites.clone().next().is_none() {
+        return None;
+    }
+    Some(
+        col()
+            .gap(8.0)
+            .key("report-group-websites")
+            .child(label("Websites", BODY, color(MUTED)))
+            .children(sites.map(|site| {
+                row()
+                    .key(format!("group-domain:{}", site.domain))
+                    .gap(10.0)
+                    .center_y()
+                    .child(
+                        label(&site.domain, BODY, color(INK))
+                            .min_w(0.0)
+                            .grow(1.0)
+                            .wrap(),
+                    )
+                    .child(label(
+                        format!(
+                            "{}  ({})",
+                            duration(site.total()),
+                            time_change(site.total() - site.previous)
+                        ),
+                        TIME,
+                        color(INK),
+                    ))
+            })),
+    )
 }
 
 fn metric(title: &str, value: String, change: String) -> El {
@@ -454,7 +622,7 @@ fn apps(s: &State, compact: bool) -> El {
         .find(|g| Some(&g.key) == s.report_group.as_ref());
     let title = selected.map_or_else(
         || "App comparison".into(),
-        |group| format!("Apps in {}", group.name),
+        |group| format!("Activity in {}", group.name),
     );
     let mut header = row()
         .center_y()
@@ -464,13 +632,25 @@ fn apps(s: &State, compact: bool) -> El {
     if selected.is_some() {
         header = header.child(button(
             "all-report-apps",
-            "Show all apps",
+            "Clear group filter",
             false,
             false,
             |s, _| s.report_group = None,
         ));
     }
-    let mut card = panel().key("report-apps").child(header).child(
+    let mut card = panel()
+        .key("report-apps")
+        .child(header)
+        .children(group_websites(s));
+    let apps = selected.map_or(&s.report.apps, |group| &group.apps);
+    if apps.is_empty() {
+        return card.child(empty_message(if selected.is_some() {
+            "No app time in this group."
+        } else {
+            "No app activity to compare."
+        }));
+    }
+    card = card.child(
         search_field(
             "report-app-search",
             "Search report apps",
@@ -479,14 +659,8 @@ fn apps(s: &State, compact: bool) -> El {
         )
         .max_w(412.0),
     );
-    if s.report.apps.is_empty() {
-        return card.child(label("No app activity to compare.", BODY, color(MUTED)).wrap());
-    }
     let query = search_query(&s.report_app_search);
-    let matching = s.report.apps.iter().filter(|usage| {
-        selected.is_none_or(|group| report::group_key(&usage.app) == group.key)
-            && usage.app.matches(&query)
-    });
+    let matching = apps.iter().filter(|usage| usage.app.matches(&query));
     if matching.clone().next().is_none() {
         return card.child(empty_message("No matching apps."));
     }
