@@ -10,7 +10,7 @@ mod preferences;
 mod reporting;
 mod sync;
 pub(crate) use coverage::covered;
-pub(crate) use reporting::AppTotals;
+pub(crate) use reporting::{AppTotals, Website};
 
 pub const DEFAULT_IDLE_SECONDS: u32 = 300;
 
@@ -19,6 +19,7 @@ pub struct Application {
     pub id: AppId,
     pub alias: Option<String>,
     pub group: Option<String>,
+    pub last_seen: Option<i64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -131,6 +132,7 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS sessions_end ON sessions(end);
              CREATE INDEX IF NOT EXISTS sessions_start ON sessions(start);
+             CREATE INDEX IF NOT EXISTS sessions_app_end ON sessions(app, end);
              CREATE TABLE IF NOT EXISTS app_groups (
                  app TEXT PRIMARY KEY REFERENCES apps(path),
                  name TEXT NOT NULL
@@ -150,6 +152,7 @@ impl Store {
                  domain TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL CHECK(end > start)
              );
              CREATE INDEX IF NOT EXISTS website_focus_end ON website_focus(end);
+             CREATE INDEX IF NOT EXISTS website_focus_domain ON website_focus(domain);
              CREATE INDEX IF NOT EXISTS website_focus_session_end ON website_focus(session_id, end);
              CREATE TABLE IF NOT EXISTS website_groups (
                  domain TEXT PRIMARY KEY, name TEXT NOT NULL
@@ -256,14 +259,22 @@ impl Store {
 
     pub fn apps(&self) -> rusqlite::Result<Vec<Application>> {
         let mut query = self.0.prepare(
-            "SELECT apps.path, apps.name, apps.alias, app_groups.name
+            "SELECT apps.path, apps.name, apps.alias, app_groups.name,
+                    (SELECT MAX(end) FROM sessions
+                     WHERE app IN (apps.path, 'sync:' || lower(apps.name)))
              FROM apps LEFT JOIN app_groups ON app_groups.app = apps.path
              WHERE apps.path NOT LIKE 'sync:%' OR NOT EXISTS (
                  SELECT 1 FROM apps AS origin WHERE origin.path NOT LIKE 'sync:%'
                  AND lower(origin.name)=lower(apps.name)
              )",
         )?;
-        query.query_map([], read_app)?.collect()
+        query
+            .query_map([], |row| {
+                let mut app = read_app(row)?;
+                app.last_seen = row.get(4)?;
+                Ok(app)
+            })?
+            .collect()
     }
 
     pub fn group_folders(&self) -> rusqlite::Result<Vec<String>> {
@@ -273,7 +284,7 @@ impl Store {
     fn folder_names(db: &Connection) -> rusqlite::Result<Vec<String>> {
         let mut query = db.prepare(
             "SELECT name FROM group_folders UNION SELECT name FROM app_groups
-             UNION SELECT name FROM website_groups",
+             UNION SELECT name FROM website_groups WHERE name <> ''",
         )?;
         query.query_map([], |row| row.get(0))?.collect()
     }
@@ -542,6 +553,7 @@ fn read_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<Application> {
         },
         alias: row.get(2)?,
         group: row.get(3)?,
+        last_seen: None,
     })
 }
 

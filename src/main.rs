@@ -20,7 +20,7 @@ use report::{Period, Report};
 use rune::{
     App, AppSpec, Image, ImageCache, TextEdit, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec, Tx,
 };
-use store::{Application, BrowserPage, DEFAULT_IDLE_SECONDS, Device, Session, Store};
+use store::{Application, BrowserPage, DEFAULT_IDLE_SECONDS, Device, Session, Store, Website};
 use websites::WebsiteProbe;
 
 struct Sample {
@@ -175,8 +175,13 @@ struct State {
     report_websites: bool,
     report_app_search: TextEdit,
     report_website_search: TextEdit,
+    settings_websites: bool,
+    websites: Vec<Website>,
+    website_search: TextEdit,
+    website_folder: Option<String>,
     website_group_domain: Option<String>,
     website_group_input: TextEdit,
+    website_notice: Option<String>,
     notice: Option<String>,
     tracking_error: Option<String>,
 }
@@ -268,8 +273,13 @@ impl State {
             report_websites: false,
             report_app_search: TextEdit::new(""),
             report_website_search: TextEdit::new(""),
+            settings_websites: false,
+            websites: Vec::new(),
+            website_search: TextEdit::new(""),
+            website_folder: None,
             website_group_domain: None,
             website_group_input: TextEdit::new(""),
+            website_notice: None,
             notice: None,
             tracking_error: None,
         };
@@ -320,6 +330,9 @@ impl State {
         {
             self.refresh();
             self.refresh_apps();
+            if self.settings_websites {
+                self.refresh_websites();
+            }
         }
     }
 
@@ -370,6 +383,7 @@ impl State {
         {
             sync.clear_password();
         }
+        self.drag_preview = None;
         self.screen = screen;
         self.notice = None;
         match screen {
@@ -392,6 +406,9 @@ impl State {
                     }
                 }
                 self.refresh_apps();
+                if self.settings_websites {
+                    self.refresh_websites();
+                }
             }
         }
     }
@@ -415,7 +432,6 @@ impl State {
             Ok((report, devices, device)) => {
                 if self.report_device != device {
                     self.report_group = None;
-                    self.website_group_domain = None;
                 }
                 self.report = report;
                 self.report_devices = devices;
@@ -434,29 +450,84 @@ impl State {
                 date
             };
             self.report_group = None;
-            self.website_group_domain = None;
             self.refresh_report();
         }
     }
 
-    fn save_website_group(&mut self) {
-        let Some(domain) = &self.website_group_domain else {
-            return;
-        };
-        let name = self.website_group_input.text.trim();
-        if !valid_folder_name(name) {
-            self.notice = Some(
-                "Use up to 64 characters on one line. Leave the group blank to remove it.".into(),
-            );
+    fn refresh_websites(&mut self) {
+        match self.store.websites() {
+            Ok(websites) => {
+                if self
+                    .website_group_domain
+                    .as_ref()
+                    .is_some_and(|domain| !websites.iter().any(|website| &website.domain == domain))
+                {
+                    self.website_group_domain = None;
+                }
+                self.websites = websites;
+            }
+            Err(error) => self.website_notice = Some(format!("Could not read websites. {error}")),
+        }
+    }
+
+    fn select_website(&mut self, domain: &str) {
+        if let Some(site) = self.websites.iter().find(|site| site.domain == domain) {
+            self.website_group_domain = Some(domain.to_owned());
+            self.website_group_input = TextEdit::new(site.group.as_deref().unwrap_or(""));
+            self.website_notice = None;
+        }
+    }
+
+    fn note_website_activity(&mut self, domain: &str, time: i64) {
+        if !self.websites.iter().any(|site| site.domain == domain) {
+            self.refresh_websites();
             return;
         }
-        match self.store.save_website_group(domain, name) {
-            Ok(()) => {
-                self.website_group_domain = None;
-                self.notice = None;
-                self.refresh_report();
+        let parent = websites::parent_domain(domain);
+        let mut changed = false;
+        for site in &mut self.websites {
+            if (site.domain == domain || Some(site.domain.as_str()) == parent)
+                && site.last_seen < time
+            {
+                site.last_seen = time;
+                changed = true;
             }
-            Err(error) => self.notice = Some(format!("Could not save the website group. {error}")),
+        }
+        if changed {
+            Website::sort_recent(&mut self.websites);
+        }
+    }
+
+    fn save_website_group(&mut self) {
+        let name = self.website_group_input.text.trim().to_owned();
+        if name.is_empty() || !valid_folder_name(&name) {
+            self.website_notice = Some("Enter a group name of up to 64 characters.".into());
+            return;
+        }
+        self.update_website_group(Some(&name));
+    }
+
+    fn update_website_group(&mut self, name: Option<&str>) {
+        let Some(domain) = self.website_group_domain.clone() else {
+            return;
+        };
+        let name = if name == Some("") && websites::parent_domain(&domain).is_none() {
+            None
+        } else {
+            name
+        };
+        match self.store.save_website_group(&domain, name) {
+            Ok(()) => {
+                self.website_notice = None;
+                self.refresh_apps();
+                self.refresh_websites();
+                if let Some(site) = self.websites.iter().find(|site| site.domain == domain) {
+                    self.website_group_input = TextEdit::new(site.group.as_deref().unwrap_or(""));
+                }
+            }
+            Err(error) => {
+                self.website_notice = Some(format!("Could not save the website group. {error}"))
+            }
         }
     }
 
@@ -542,10 +613,17 @@ impl State {
                             id: id.clone(),
                             alias: None,
                             group: None,
+                            last_seen: None,
                         });
                     }
                 }
-                apps.sort_by_cached_key(|app| (app.label().to_lowercase(), app.id.key.clone()));
+                apps.sort_by_cached_key(|app| {
+                    (
+                        std::cmp::Reverse(app.last_seen),
+                        app.label().to_lowercase(),
+                        app.id.key.clone(),
+                    )
+                });
                 self.apps = apps;
             }
             Err(error) => self.notice = Some(format!("Could not read apps. {error}")),
@@ -558,6 +636,13 @@ impl State {
                     .collect()
             }
             Err(error) => self.notice = Some(format!("Could not read folders. {error}")),
+        }
+        if self
+            .website_folder
+            .as_ref()
+            .is_some_and(|key| !key.is_empty() && !self.folders.contains_key(key))
+        {
+            self.website_folder = None;
         }
     }
 
@@ -858,6 +943,9 @@ fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
             Screen::Calendar => state.show_month(state.month),
             Screen::Settings => {
                 state.refresh_apps();
+                if state.settings_websites {
+                    state.refresh_websites();
+                }
                 if state
                     .folder
                     .as_ref()
@@ -926,6 +1014,13 @@ fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
                     next_session = Some(id);
                 }
                 state.tracking_error = None;
+                if state.screen == Screen::Settings
+                    && state.settings_websites
+                    && state.drag_preview.is_none()
+                    && let Some(domain) = domain.as_deref()
+                {
+                    state.note_website_activity(domain, end);
+                }
                 refresh = true;
             }
             Err(error) => {
@@ -935,7 +1030,8 @@ fn poll(state: &mut State, clock: f64, tx: &mut Tx) -> bool {
     }
     state.continuing = next_session;
 
-    if state.screen == Screen::Settings && clock >= state.next_scan {
+    if state.screen == Screen::Settings && state.drag_preview.is_none() && clock >= state.next_scan
+    {
         state.open_apps = platform::open_apps();
         state.next_scan = clock + 3.0;
         state.refresh_apps();
@@ -1002,7 +1098,7 @@ fn sample_data(state: &mut State) {
                     _ => None,
                 },
                 match index {
-                    1 if start < 700 => Some("chrome.com"),
+                    1 if start < 700 => Some("developer.chrome.com"),
                     1 => Some("rust-lang.org"),
                     4 => Some("mozilla.org"),
                     _ => None,

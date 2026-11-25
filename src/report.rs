@@ -267,6 +267,112 @@ mod tests {
     use crate::platform::AppId;
 
     #[test]
+    fn website_settings_list_unique_hosts_and_subdomains_override_parent_groups() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let start = Local
+            .from_local_datetime(&day.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let browser = AppId {
+            key: "chrome.exe".into(),
+            name: "chrome".into(),
+        };
+        let mut record = |offset, domain| {
+            store
+                .record(
+                    &browser,
+                    start + offset,
+                    start + offset + 1000,
+                    None,
+                    None,
+                    Some(domain),
+                )
+                .unwrap();
+        };
+        record(-86_400_000, "example.com");
+        record(0, "news.example.com");
+        record(1500, "news.example.com");
+        record(3000, "docs.example.com");
+        store
+            .save_website_group("example.com", Some("Reading"))
+            .unwrap();
+        store
+            .save_website_group("docs.example.com", Some("Work"))
+            .unwrap();
+
+        let sites = store.websites().unwrap();
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| (
+                    site.domain.as_str(),
+                    site.group.as_deref(),
+                    site.has_assignment
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("example.com", Some("Reading"), true),
+                ("docs.example.com", Some("Work"), true),
+                ("news.example.com", Some("Reading"), false),
+            ]
+        );
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!(report.total.time, 3000);
+        assert_eq!(report.groups[0].name, "Reading");
+        assert_eq!(
+            (
+                report.groups[0].current.time,
+                report.groups[0].previous.time
+            ),
+            (2000, 1000)
+        );
+        assert_eq!(report.groups[1].name, "Work");
+        assert_eq!(report.groups[1].current.time, 1000);
+
+        store
+            .save_website_group("news.example.com", Some(""))
+            .unwrap();
+        assert!(store.websites().unwrap()[2].group.is_none());
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!(report.groups[0].name, "Ungrouped");
+        assert_eq!(report.groups[0].current.time, 2000);
+        store.save_website_group("news.example.com", None).unwrap();
+        assert_eq!(
+            store.websites().unwrap()[2].group.as_deref(),
+            Some("Reading")
+        );
+        store
+            .save_website_group("news.example.com", Some(""))
+            .unwrap();
+        store
+            .save_website_group("example.com", Some("Projects"))
+            .unwrap();
+        let sites = store.websites().unwrap();
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.group.as_deref() == Some("Projects"))
+        );
+        assert!(
+            sites
+                .iter()
+                .filter(|site| site.parent.is_some())
+                .all(|site| !site.has_assignment)
+        );
+        let grouped = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!(grouped.groups.len(), 1);
+        assert_eq!(
+            (
+                grouped.groups[0].name.as_str(),
+                grouped.groups[0].current.time
+            ),
+            ("Projects", 3000)
+        );
+    }
+
+    #[test]
     fn website_and_app_time_share_groups_without_counting_browser_time_twice() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
         let noon = Local
@@ -306,7 +412,9 @@ mod tests {
             .unwrap();
         store.save_groups(&[editor], "Work").unwrap();
         store.save_groups(&[browser], "Browsing").unwrap();
-        store.save_website_group("work.example", "work").unwrap();
+        store
+            .save_website_group("work.example", Some("work"))
+            .unwrap();
 
         let report = Report::load(&store, Period::Daily, day, None).unwrap();
         assert_eq!((report.total.time, report.total.sessions), (9000, 2));

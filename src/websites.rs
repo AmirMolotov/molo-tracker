@@ -130,7 +130,7 @@ impl Reader {
                 && let Ok(address) = value.CurrentValue()
                 && !address.is_empty()
             {
-                return main_domain(&address.to_string(), false);
+                return website_host(&address.to_string(), false);
             }
             let selector = if target.chrome {
                 &self.chrome_address
@@ -145,12 +145,16 @@ impl Reader {
             }
             let value: IUIAutomationValuePattern =
                 address_bar.GetCurrentPatternAs(UIA_ValuePatternId).ok()?;
-            main_domain(&value.CurrentValue().ok()?.to_string(), true)
+            website_host(&value.CurrentValue().ok()?.to_string(), true)
         }
     }
 }
 
-fn main_domain(address: &str, allow_hidden_scheme: bool) -> Option<String> {
+pub(crate) fn parent_domain(host: &str) -> Option<&str> {
+    psl::domain_str(host).filter(|domain| *domain != host)
+}
+
+fn website_host(address: &str, allow_hidden_scheme: bool) -> Option<String> {
     let address = address.trim();
     let parsed = match url::Url::parse(address) {
         Ok(url) if !url.cannot_be_a_base() => url,
@@ -167,31 +171,36 @@ fn main_domain(address: &str, allow_hidden_scheme: bool) -> Option<String> {
     if !suffix.is_known() {
         return None;
     }
-    psl::domain_str(host).map(str::to_owned)
+    psl::domain_str(host).map(|_| host.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::main_domain;
+    use super::{parent_domain, website_host};
 
     #[test]
-    fn groups_subdomains_by_registrable_domain_and_skips_internal_pages() {
+    fn keeps_hostname_without_path_and_skips_internal_pages() {
         for (url, domain) in [
-            ("https://news.bbc.co.uk/article?q=foo", Some("bbc.co.uk")),
-            ("https://www.youtube.com/watch", Some("youtube.com")),
-            ("https://a.alice.github.io/blog", Some("alice.github.io")),
-            ("https://www.مثال.com", Some("xn--mgbh0fb.com")),
+            (
+                "https://NEWS.bbc.co.uk.:443/article?q=foo",
+                Some("news.bbc.co.uk"),
+            ),
+            ("https://www.youtube.com/watch", Some("www.youtube.com")),
+            ("https://a.alice.github.io/blog", Some("a.alice.github.io")),
+            ("https://www.مثال.com", Some("www.xn--mgbh0fb.com")),
             ("about:config", None),
             ("chrome://newtab", None),
             ("file:///C:/private.txt", None),
             ("http://127.0.0.1:9000/", None),
         ] {
-            assert_eq!(main_domain(url, false).as_deref(), domain);
+            assert_eq!(website_host(url, false).as_deref(), domain);
         }
         assert_eq!(
-            main_domain("www.example.com/docs", true).as_deref(),
-            Some("example.com")
+            website_host("www.example.com/docs", true).as_deref(),
+            Some("www.example.com")
         );
-        assert_eq!(main_domain("draft search terms", true), None);
+        assert_eq!(website_host("draft search terms", true), None);
+        assert_eq!(parent_domain("news.bbc.co.uk"), Some("bbc.co.uk"));
+        assert_eq!(parent_domain("bbc.co.uk"), None);
     }
 }

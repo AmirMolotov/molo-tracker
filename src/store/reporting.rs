@@ -1,8 +1,11 @@
+use std::cmp::Reverse;
+
 use rusqlite::params;
 
 use super::{
     Application, BTreeMap, BTreeSet, DeviceUsage, NaiveDate, Store, Usage, coverage, day_start,
 };
+use crate::websites::parent_domain;
 
 pub(crate) type AppTotals = BTreeMap<String, (Application, Usage)>;
 
@@ -28,23 +31,106 @@ struct WebsiteSpan {
     end: i64,
 }
 
+pub(crate) struct Website {
+    pub domain: String,
+    pub parent: Option<String>,
+    pub group: Option<String>,
+    pub has_assignment: bool,
+    pub last_seen: i64,
+}
+
+impl Website {
+    pub fn sort_recent(sites: &mut [Self]) {
+        sites.sort_by(|a, b| {
+            (
+                Reverse(a.last_seen),
+                a.parent.as_deref().unwrap_or(&a.domain),
+                a.parent.is_some(),
+                &a.domain,
+            )
+                .cmp(&(
+                    Reverse(b.last_seen),
+                    b.parent.as_deref().unwrap_or(&b.domain),
+                    b.parent.is_some(),
+                    &b.domain,
+                ))
+        });
+    }
+}
+
 impl Store {
-    pub fn save_website_group(&mut self, domain: &str, name: &str) -> rusqlite::Result<()> {
+    fn website_assignments(&self) -> rusqlite::Result<BTreeMap<String, String>> {
+        let mut query = self.0.prepare("SELECT domain, name FROM website_groups")?;
+        query
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    }
+
+    pub fn websites(&self) -> rusqlite::Result<Vec<Website>> {
+        let assignments = self.website_assignments()?;
+        let mut query = self.0.prepare(
+            "SELECT domain, MAX(end) FROM website_focus WHERE domain <> '' GROUP BY domain",
+        )?;
+        let mut latest = BTreeMap::<String, i64>::new();
+        for entry in query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (host, end) = entry?;
+            if let Some(parent) = parent_domain(&host) {
+                let time = latest.entry(parent.to_owned()).or_insert(end);
+                *time = (*time).max(end);
+            }
+            let time = latest.entry(host).or_insert(end);
+            *time = (*time).max(end);
+        }
+        let mut sites: Vec<_> = latest
+            .into_iter()
+            .map(|(domain, last_seen)| Website {
+                parent: parent_domain(&domain).map(str::to_owned),
+                group: website_group(&assignments, &domain).cloned(),
+                has_assignment: assignments.contains_key(&domain),
+                domain,
+                last_seen,
+            })
+            .collect();
+        Website::sort_recent(&mut sites);
+        Ok(sites)
+    }
+
+    pub fn save_website_group(&mut self, domain: &str, name: Option<&str>) -> rusqlite::Result<()> {
         let tx = self.0.transaction()?;
-        if name.is_empty() {
-            tx.execute("DELETE FROM website_groups WHERE domain = ?1", [domain])?;
-        } else {
+        if let Some(name) = name {
             let key = name.to_lowercase();
             let names = Self::folder_names(&tx)?;
             let name = names
                 .iter()
                 .find(|name| name.to_lowercase() == key)
                 .map_or(name, String::as_str);
+            if !name.is_empty() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO group_folders(name) VALUES (?1)",
+                    [name],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO website_groups(domain, name) VALUES (?1, ?2)
                  ON CONFLICT(domain) DO UPDATE SET name = excluded.name",
                 params![domain, name],
             )?;
+        } else {
+            tx.execute("DELETE FROM website_groups WHERE domain = ?1", [domain])?;
+        }
+        if parent_domain(domain).is_none() {
+            let mut query = tx.prepare("SELECT domain FROM website_groups")?;
+            let children = query
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for child in children
+                .iter()
+                .filter(|child| parent_domain(child) == Some(domain))
+            {
+                tx.execute("DELETE FROM website_groups WHERE domain = ?1", [child])?;
+            }
         }
         tx.commit()
     }
@@ -71,12 +157,12 @@ impl Store {
             .map(|part| part.session.id)
             .collect();
         let mut spans = BTreeMap::<i64, Vec<WebsiteSpan>>::new();
-        let mut groups = BTreeMap::<String, String>::new();
-        if !browser_sessions.is_empty() {
+        let groups = if browser_sessions.is_empty() {
+            BTreeMap::new()
+        } else {
             let mut query = self.0.prepare(
-                "SELECT focus.session_id, focus.domain, focus.start, focus.end, website_groups.name
+                "SELECT focus.session_id, focus.domain, focus.start, focus.end
                  FROM website_focus AS focus
-                 LEFT JOIN website_groups ON website_groups.domain = focus.domain
                  WHERE focus.end > ?1 AND focus.start < ?2
                  ORDER BY focus.session_id, focus.start, focus.id",
             )?;
@@ -94,14 +180,15 @@ impl Store {
                     .last()
                     .map_or(start, |prior| start.max(prior.end));
                 if start < end {
-                    let domain: String = row.get(1)?;
-                    if let Some(group) = row.get(4)? {
-                        groups.entry(domain.clone()).or_insert(group);
-                    }
-                    session_spans.push(WebsiteSpan { domain, start, end });
+                    session_spans.push(WebsiteSpan {
+                        domain: row.get(1)?,
+                        start,
+                        end,
+                    });
                 }
             }
-        }
+            self.website_assignments()?
+        };
         let mut counted = BTreeSet::new();
         for part in pieces {
             let session = part.session;
@@ -123,7 +210,7 @@ impl Store {
                         .websites
                         .entry(span.domain.clone())
                         .or_insert_with(|| WebsiteTime {
-                            group: groups.get(&span.domain).cloned(),
+                            group: website_group(&groups, &span.domain).cloned(),
                             ..WebsiteTime::default()
                         });
                     if chrome {
@@ -154,6 +241,16 @@ impl Store {
         }
         Ok(result)
     }
+}
+
+fn website_group<'a>(
+    assignments: &'a BTreeMap<String, String>,
+    domain: &str,
+) -> Option<&'a String> {
+    assignments
+        .get(domain)
+        .or_else(|| parent_domain(domain).and_then(|parent| assignments.get(parent)))
+        .filter(|name| !name.is_empty())
 }
 
 fn add_app_time(apps: &mut AppTotals, app: &Application, time: i64, starts: bool) {

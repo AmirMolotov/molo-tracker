@@ -27,7 +27,7 @@ pub(super) fn view(s: &State, compact: bool) -> El {
             button(key, option.label(), period == option, false, move |s, _| {
                 s.report_period = option;
                 s.report_group = None;
-                s.website_group_domain = None;
+
                 s.refresh_report();
             })
             .checked(period == option)
@@ -64,7 +64,7 @@ pub(super) fn view(s: &State, compact: bool) -> El {
         button("report-current", jump_label, false, false, |s, _| {
             s.report_date = s.today;
             s.report_group = None;
-            s.website_group_domain = None;
+
             s.refresh_report();
         })
     }));
@@ -307,23 +307,6 @@ fn websites(s: &State, compact: bool) -> El {
         );
     }
     for site in matching {
-        let editing = s.website_group_domain.as_ref() == Some(&site.domain);
-        let domain_key = site.domain.clone();
-        let group_name = site.group.clone();
-        let group = button(
-            &format!("website-group:{}", site.domain),
-            site.group.as_deref().unwrap_or("Set group"),
-            editing,
-            false,
-            move |s, tx| {
-                s.website_group_domain = Some(domain_key.clone());
-                s.website_group_input = TextEdit::new(group_name.as_deref().unwrap_or(""));
-                s.notice = None;
-                tx.focus("website-group-input", true);
-            },
-        )
-        .w(128.0)
-        .label(format!("Edit group for {}", site.domain));
         let time = format!(
             "{}  ({})",
             duration(site.total()),
@@ -334,10 +317,20 @@ fn websites(s: &State, compact: bool) -> El {
             .grow(1.0)
             .truncate()
             .help_when_truncated(&site.domain);
+        let group_name = site.group.as_deref().unwrap_or("");
+        let group = label(group_name, BODY, color(MUTED))
+            .truncate()
+            .help_when_truncated(group_name);
         let entry = if compact {
             col()
                 .gap(5.0)
-                .child(row().gap(8.0).center_y().child(domain).child(group))
+                .child(
+                    row()
+                        .gap(8.0)
+                        .center_y()
+                        .child(domain)
+                        .child(group.max_w(110.0)),
+                )
                 .child(
                     label(
                         format!(
@@ -357,75 +350,16 @@ fn websites(s: &State, compact: bool) -> El {
                 .gap(10.0)
                 .min_h(34.0)
                 .child(domain)
-                .child(group)
+                .child(group.w(128.0))
                 .child(label(duration(site.chrome), TIME, color(MUTED)).w(94.0))
                 .child(label(duration(site.firefox), TIME, color(MUTED)).w(94.0))
                 .child(label(time, TIME, color(INK)).w(190.0))
         };
         card = card
             .child(separator())
-            .child(entry.key(format!("domain:{}", site.domain)))
-            .children(editing.then(|| website_group_editor(s)));
+            .child(entry.key(format!("domain:{}", site.domain)));
     }
     card
-}
-
-fn website_group_editor(s: &State) -> El {
-    col()
-        .gap(8.0)
-        .padding(12.0)
-        .radius(8.0)
-        .fill(color(BASE))
-        .child(
-            label(
-                "Use an existing group name or enter a new one. Leave blank to clear.",
-                BODY,
-                color(MUTED),
-            )
-            .wrap(),
-        )
-        .child(
-            el().w_full()
-                .max_w(420.0)
-                .h(44.0)
-                .px(10.0)
-                .center_y()
-                .radius(8.0)
-                .border(1.0, color(LINE))
-                .fill(color(SURFACE))
-                .child(
-                    text_input(&s.website_group_input, BODY)
-                        .key("website-group-input")
-                        .label("Group name")
-                        .single_line()
-                        .color(color(INK))
-                        .w_full()
-                        .on_edit(|s: &mut State| &mut s.website_group_input)
-                        .on_submit(|s: &mut State, _| s.save_website_group()),
-                ),
-        )
-        .child(
-            row()
-                .gap(8.0)
-                .flex_wrap()
-                .child(button(
-                    "save-website-group",
-                    "Save group",
-                    true,
-                    false,
-                    |s, _| s.save_website_group(),
-                ))
-                .child(button(
-                    "cancel-website-group",
-                    "Cancel",
-                    false,
-                    false,
-                    |s, _| {
-                        s.website_group_domain = None;
-                        s.notice = None;
-                    },
-                )),
-        )
 }
 
 fn group_websites(s: &State) -> Option<El> {

@@ -12,6 +12,7 @@ use crate::store::Session;
 use crate::{GroupEdit, Screen, State};
 
 mod reports;
+mod website_settings;
 
 const BASE: u32 = 0xe9ebe5;
 const SURFACE: u32 = 0xf7f8f3;
@@ -224,6 +225,9 @@ pub fn search_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         Screen::Activity => ("chart-search", &mut s.chart_search),
         Screen::Settings if s.idle_exceptions_open => {
             ("idle-exception-search", &mut s.idle_exception_search)
+        }
+        Screen::Settings if s.settings_websites => {
+            ("settings-website-search", &mut s.website_search)
         }
         Screen::Settings => ("folder-search", &mut s.folder_search),
         Screen::Reports if s.report_websites => {
@@ -477,43 +481,57 @@ fn activity(s: &State, compact: bool) -> El {
         .child(timetable(s, compact))
 }
 
-fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
-    use std::rc::Rc;
-
-    let bounds = cx.window_layout("page");
-    let targets = Rc::new(
-        std::iter::once("")
-            .chain(s.folders.keys().map(String::as_str))
-            .filter_map(|key| {
-                cx.window_layout(&format!("folder:{key}"))
-                    .map(|rect| (key.to_owned(), rect))
-            })
-            .collect::<Vec<_>>(),
-    );
-
-    let mut folders = row()
-        .key("app-folders")
+fn aliases_and_groups(s: &State, compact: bool, cx: &Cx<State>) -> El {
+    let tabs = row()
         .gap(6.0)
-        .flex_wrap()
-        .child(button(
-            "folder-all",
-            "All apps",
-            s.folder.is_none(),
-            false,
-            |s, tx| {
-                s.open_folder(None);
-                tx.scroll_to_instant("folder-apps", 0.0, 0.0);
-            },
-        ))
-        .child(folder_button(s, "", "Ungrouped"));
-    for (key, name) in &s.folders {
-        folders = folders.child(folder_button(s, key, name));
-    }
+        .role("group")
+        .label("Group settings")
+        .child(
+            button(
+                "manage-apps",
+                "Apps",
+                !s.settings_websites,
+                false,
+                |s, _| {
+                    s.settings_websites = false;
+                    s.drag_preview = None;
+                },
+            )
+            .checked(!s.settings_websites),
+        )
+        .child(
+            button(
+                "manage-websites",
+                "Websites",
+                s.settings_websites,
+                false,
+                |s, _| {
+                    s.settings_websites = true;
+                    s.drag_preview = None;
+                    s.refresh_websites();
+                },
+            )
+            .checked(s.settings_websites),
+        );
+    col()
+        .key("aliases-content")
+        .w_full()
+        .gap(12.0)
+        .child(heading("App aliases and groups", 2))
+        .child(tabs)
+        .child(if s.settings_websites {
+            website_settings::view(s, compact, cx)
+        } else {
+            aliases(s, compact, cx)
+        })
+}
+
+fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
+    let targets = GroupDropTargets::new(s, cx);
     let mut entries = col().key("app-rows").w_full().gap(3.0);
     for app in s.visible_apps() {
         let key = app.id.key.clone();
-        let drag_key = key.clone();
-        let targets = targets.clone();
+        let drag = group_drag(key.clone(), targets.clone());
         let selected = s.selection.contains(&key);
         let lifted = selected && s.drag_preview.is_some();
         let name = app.label().to_owned();
@@ -540,47 +558,7 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
                     let mods = tx.mods();
                     s.select(&key, mods.ctrl, mods.shift);
                 })
-                .on_drag(move |s: &mut State, drag, tx| match drag.phase {
-                    rune::Phase::Down => drag.data = 0.0,
-                    rune::Phase::Move if drag.dx.hypot(drag.dy) >= 6.0 || drag.data != 0.0 => {
-                        if drag.data == 0.0 {
-                            drag.data = 1.0;
-                            if !s.selection.contains(&drag_key) {
-                                s.select(&drag_key, false, false);
-                            }
-                            tx.animated();
-                        }
-                        let point = drag.window_point();
-                        let target = targets
-                            .iter()
-                            .find(|(_, rect)| {
-                                contains(*rect, point)
-                                    && bounds.is_some_and(|rect| contains(rect, point))
-                            })
-                            .map(|(group, _)| group.clone());
-                        s.drag_preview = Some(crate::DragPreview {
-                            source: drag_key.clone(),
-                            point,
-                            target,
-                        });
-                    }
-                    rune::Phase::Up => {
-                        if s.drag_preview.take().is_some() {
-                            tx.animated();
-                        }
-                        let point = drag.window_point();
-                        if drag.data != 0.0
-                            && !drag.cancelled()
-                            && bounds.is_some_and(|rect| contains(rect, point))
-                            && let Some((key, _)) =
-                                targets.iter().find(|(_, rect)| contains(*rect, point))
-                        {
-                            let name = s.folders.get(key).cloned().unwrap_or_default();
-                            s.move_to_group(&name);
-                        }
-                    }
-                    _ => {}
-                })
+                .on_drag(drag)
                 .child(
                     label(name, BODY, color(INK))
                         .grow(1.0)
@@ -602,9 +580,8 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
         ));
     }
     let list = panel().key("app-list").grow(1.0)
-        .child(heading("App aliases and groups", 2))
         .child(label("Ctrl-click to toggle apps or Shift-click to select a range. Drop selected apps on a group.", BODY, color(MUTED)).wrap())
-        .child(folders)
+        .child(group_folders(s))
         .children(s.folder.as_ref().and_then(|key| s.folders.get(key)).map(|name| folder_editor(s, name)))
         .children(s.folder_notice.as_ref().map(|message| label(message, BODY, color(FOREST)).wrap()))
         .child(search_field("folder-search", "Search apps in this group", &s.folder_search, |s| &mut s.folder_search))
@@ -694,12 +671,7 @@ fn aliases(s: &State, compact: bool, cx: &Cx<State>) -> El {
         editor = editor.child(label(message, BODY, color(FOREST)).wrap());
     }
     let split = if compact { col() } else { row().items_start() };
-    split
-        .key("aliases-content")
-        .w_full()
-        .gap(14.0)
-        .child(list)
-        .child(editor)
+    split.w_full().gap(14.0).child(list).child(editor)
 }
 
 fn folder_editor(s: &State, folder: &str) -> El {
@@ -917,8 +889,125 @@ fn contains([x, y, w, h]: [f32; 4], [px, py]: [f32; 2]) -> bool {
     px >= x && px < x + w && py >= y && py < y + h
 }
 
+#[derive(Clone)]
+struct GroupDropTargets {
+    page: Option<[f32; 4]>,
+    folders: std::rc::Rc<Vec<(String, [f32; 4])>>,
+}
+
+impl GroupDropTargets {
+    fn new(s: &State, cx: &Cx<State>) -> Self {
+        let folders = std::iter::once("")
+            .chain(s.folders.keys().map(String::as_str))
+            .filter_map(|key| {
+                cx.window_layout(&format!("folder:{key}"))
+                    .map(|rect| (key.to_owned(), rect))
+            })
+            .collect();
+        Self {
+            page: cx.window_layout("page"),
+            folders: std::rc::Rc::new(folders),
+        }
+    }
+
+    fn at(&self, point: [f32; 2]) -> Option<&str> {
+        self.page.filter(|rect| contains(*rect, point))?;
+        self.folders
+            .iter()
+            .find(|(_, rect)| contains(*rect, point))
+            .map(|(key, _)| key.as_str())
+    }
+}
+
+fn group_drag(
+    source: String,
+    targets: GroupDropTargets,
+) -> impl Fn(&mut State, &mut rune::Drag, &mut Tx) {
+    move |s, drag, tx| match drag.phase {
+        rune::Phase::Down => drag.data = 0.0,
+        rune::Phase::Move if drag.dx.hypot(drag.dy) >= 6.0 || drag.data != 0.0 => {
+            if drag.data == 0.0 {
+                drag.data = 1.0;
+                if s.settings_websites {
+                    s.select_website(&source);
+                } else if !s.selection.contains(&source) {
+                    s.select(&source, false, false);
+                }
+                tx.animated();
+            }
+            let point = drag.window_point();
+            s.drag_preview = Some(crate::DragPreview {
+                source: source.clone(),
+                point,
+                target: targets.at(point).map(str::to_owned),
+            });
+        }
+        rune::Phase::Up => {
+            if s.drag_preview.take().is_some() {
+                tx.animated();
+            }
+            if drag.data != 0.0
+                && !drag.cancelled()
+                && let Some(key) = targets.at(drag.window_point())
+            {
+                let name = s.folders.get(key).cloned().unwrap_or_default();
+                if s.settings_websites {
+                    s.update_website_group(Some(&name));
+                } else {
+                    s.move_to_group(&name);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn open_group_filter(s: &mut State, tx: &mut Tx, key: Option<String>) {
+    if s.settings_websites {
+        s.website_folder = key;
+        s.website_group_domain = None;
+        s.website_notice = None;
+        tx.scroll_to_instant("settings-website-list", 0.0, 0.0);
+    } else {
+        s.open_folder(key);
+        tx.scroll_to_instant("folder-apps", 0.0, 0.0);
+    }
+}
+
+fn group_folders(s: &State) -> El {
+    let (all, filter) = if s.settings_websites {
+        ("All websites", &s.website_folder)
+    } else {
+        ("All apps", &s.folder)
+    };
+    row()
+        .key("app-folders")
+        .gap(6.0)
+        .flex_wrap()
+        .child(button(
+            "folder-all",
+            all,
+            filter.is_none(),
+            false,
+            |s, tx| {
+                open_group_filter(s, tx, None);
+            },
+        ))
+        .child(folder_button(s, "", "Ungrouped"))
+        .children(
+            s.folders
+                .iter()
+                .map(|(key, name)| folder_button(s, key, name)),
+        )
+}
+
 fn folder_button(s: &State, key: &str, name: &str) -> El {
-    let selected = s.folder.as_deref() == Some(key);
+    let filter = if s.settings_websites {
+        &s.website_folder
+    } else {
+        &s.folder
+    };
+    let selected = filter.as_deref() == Some(key);
     let over = s
         .drag_preview
         .as_ref()
@@ -948,8 +1037,7 @@ fn folder_button(s: &State, key: &str, name: &str) -> El {
         }))
         .hover(color(if selected { 0x2b5543 } else { 0xddebd6 }))
         .on_press_tx(move |s: &mut State, tx| {
-            s.open_folder(Some(key.clone()));
-            tx.scroll_to_instant("folder-apps", 0.0, 0.0);
+            open_group_filter(s, tx, Some(key.clone()));
         })
         .child(
             col()
@@ -967,8 +1055,12 @@ fn folder_button(s: &State, key: &str, name: &str) -> El {
 
 fn drag_ghost(s: &State, viewport: [f32; 2]) -> Option<El> {
     let drag = s.drag_preview.as_ref()?;
-    let app = s.apps.iter().find(|app| app.id.key == drag.source)?;
-    let count = s.selection.len();
+    let (name, count) = if s.settings_websites {
+        (drag.source.as_str(), 1)
+    } else {
+        let app = s.apps.iter().find(|app| app.id.key == drag.source)?;
+        (app.label(), s.selection.len())
+    };
     let [width, height] = viewport;
     let card_width = 224.0;
     let card_height = 46.0;
@@ -1008,9 +1100,9 @@ fn drag_ghost(s: &State, viewport: [f32; 2]) -> Option<El> {
             .shadow(6.0, 14.0, color(INK).alpha(0.28))
             .inert()
             .a11y_hidden()
-            .child(app_mark(s, &drag.source))
+            .children((!s.settings_websites).then(|| app_mark(s, &drag.source)))
             .child(
-                label(app.label(), BODY, color(PAPER))
+                label(name, BODY, color(PAPER))
                     .grow(1.0)
                     .min_w(0.0)
                     .truncate(),
@@ -1198,7 +1290,7 @@ fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
             .children(sync_settings(s))
             .child(idle)
             .child(cutoff)
-            .child(aliases(s, compact, cx).min_h(last_section_height)),
+            .child(aliases_and_groups(s, compact, cx).min_h(last_section_height)),
     )
 }
 
