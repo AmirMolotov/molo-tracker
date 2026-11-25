@@ -214,14 +214,17 @@ fn two_devices_exchange_history_through_the_http_api() {
     assert!(outsider.day(date).unwrap().is_empty());
     let tomorrow = date.succ_opt().unwrap();
     for (store, other_name) in [(&first, "Laptop"), (&second, "Desktop")] {
-        let app_usage = store.usage(date, tomorrow).unwrap();
+        let app_usage = store.usage(date, tomorrow, None).unwrap();
         assert_eq!(app_usage.len(), 2);
         assert!(
             app_usage
                 .iter()
                 .all(|(_, usage)| usage.time == 500 && usage.sessions == 1)
         );
-        assert_eq!(store.website_time(date, tomorrow).unwrap()[0].chrome, 500);
+        assert_eq!(
+            store.website_time(date, tomorrow, None).unwrap()[0].chrome,
+            500
+        );
         let per_device = store.devices(date, tomorrow).unwrap();
         assert_eq!(
             per_device.iter().map(|d| d.time).collect::<Vec<_>>(),

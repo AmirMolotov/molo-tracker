@@ -111,7 +111,12 @@ impl Usage {
 }
 
 impl Report {
-    pub fn load(store: &Store, period: Period, date: NaiveDate) -> rusqlite::Result<Self> {
+    pub fn load(
+        store: &Store,
+        period: Period,
+        date: NaiveDate,
+        device: Option<&str>,
+    ) -> rusqlite::Result<Self> {
         let start = period.start(date);
         let (Some(previous), Some(end)) =
             (period.adjacent(start, false), period.adjacent(start, true))
@@ -119,7 +124,7 @@ impl Report {
             return Ok(Self::default());
         };
         let mut by_app = BTreeMap::new();
-        for (app, usage) in store.usage(previous, start)? {
+        for (app, usage) in store.usage(previous, start, device)? {
             by_app.insert(
                 app.id.key.clone(),
                 AppUsage {
@@ -129,7 +134,7 @@ impl Report {
                 },
             );
         }
-        for (app, usage) in store.usage(start, end)? {
+        for (app, usage) in store.usage(start, end, device)? {
             by_app
                 .entry(app.id.key.clone())
                 .or_insert(AppUsage {
@@ -140,10 +145,10 @@ impl Report {
                 .current = usage;
         }
 
-        let mut result = Self {
-            devices: store.devices(start, end)?,
-            ..Self::default()
-        };
+        let mut result = Self::default();
+        if device.is_none() {
+            result.devices = store.devices(start, end)?;
+        }
         let mut groups = BTreeMap::new();
         for app in by_app.into_values() {
             let key = group_key(&app.app);
@@ -173,7 +178,7 @@ impl Report {
                 .then_with(|| a.name.cmp(&b.name))
         });
         let mut domains = BTreeMap::new();
-        for data in store.website_time(previous, start)? {
+        for data in store.website_time(previous, start, device)? {
             domains.insert(
                 data.domain.clone(),
                 WebsiteUsage {
@@ -183,7 +188,7 @@ impl Report {
                 },
             );
         }
-        for data in store.website_time(start, end)? {
+        for data in store.website_time(start, end, device)? {
             let website = domains
                 .entry(data.domain.clone())
                 .or_insert_with(|| WebsiteUsage {
@@ -249,7 +254,7 @@ mod tests {
             .save_groups(std::slice::from_ref(&puzzle), "games")
             .unwrap();
 
-        let report = Report::load(&store, Period::Daily, day).unwrap();
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
         assert_eq!(report.groups.len(), 1);
         assert_eq!((report.total.time, report.total.sessions), (9000, 1));
         assert_eq!((report.previous.time, report.previous.sessions), (2000, 1));
@@ -259,6 +264,112 @@ mod tests {
             Period::Monthly.adjacent(Period::Monthly.start(day), true),
             NaiveDate::from_ymd_opt(2026, 12, 1)
         );
+    }
+
+    #[test]
+    fn device_report_applies_coverage_and_comparison_to_that_device() {
+        use crate::sync::{Delta, Span};
+
+        let day = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let midnight = Local
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let chrome = AppId {
+            key: "chrome.exe".into(),
+            name: "chrome".into(),
+        };
+        store
+            .record(
+                &chrome,
+                midnight,
+                midnight + 5000,
+                None,
+                None,
+                Some("local.example"),
+            )
+            .unwrap();
+        store.save_groups(&[chrome], "Work").unwrap();
+        let remote = "remote-pc";
+        let session = |id, start, end| Delta {
+            device: remote.into(),
+            id,
+            app: "firefox".into(),
+            start,
+            end,
+            pages: Vec::new(),
+            domains: vec![Span {
+                value: "remote.example".into(),
+                start,
+                end,
+            }],
+        };
+        store
+            .apply_sync(
+                &[],
+                1,
+                &[
+                    session(1, midnight - 3000, midnight),
+                    session(2, midnight + 1000, midnight + 4000),
+                ],
+                &BTreeMap::from([(remote.into(), "Laptop".into())]),
+                None,
+            )
+            .unwrap();
+
+        let devices = store.report_devices().unwrap();
+        assert!(devices[0].local);
+        assert_eq!(
+            (devices[1].id.as_str(), devices[1].name.as_str()),
+            (remote, "Laptop")
+        );
+        let combined = Report::load(&store, Period::Daily, day, None).unwrap();
+        assert_eq!(combined.total.time, 5000);
+        assert_eq!(
+            combined
+                .devices
+                .iter()
+                .map(|device| device.time)
+                .sum::<i64>(),
+            8000
+        );
+
+        let local = Report::load(&store, Period::Daily, day, Some(&devices[0].id)).unwrap();
+        assert_eq!(
+            (local.total.time, local.total.sessions, local.previous.time),
+            (5000, 1, 0)
+        );
+        assert_eq!(
+            (local.groups[0].name.as_str(), local.groups[0].current.time),
+            ("Work", 5000)
+        );
+        assert_eq!(local.websites.len(), 1);
+        assert_eq!(
+            (local.websites[0].domain.as_str(), local.websites[0].chrome),
+            ("local.example", 5000)
+        );
+
+        let laptop = Report::load(&store, Period::Daily, day, Some(remote)).unwrap();
+        assert_eq!(
+            (
+                laptop.total.time,
+                laptop.total.sessions,
+                laptop.previous.time
+            ),
+            (3000, 1, 3000)
+        );
+        assert_eq!(laptop.apps.len(), 1);
+        assert_eq!(laptop.apps[0].app.label(), "firefox");
+        assert_eq!(laptop.websites.len(), 1);
+        assert_eq!(
+            (laptop.websites[0].firefox, laptop.websites[0].previous),
+            (3000, 3000)
+        );
+        let later =
+            Report::load(&store, Period::Daily, day.succ_opt().unwrap(), Some(remote)).unwrap();
+        assert_eq!((later.total.time, later.previous.time), (0, 3000));
     }
 
     #[test]
@@ -319,7 +430,7 @@ mod tests {
             )
             .unwrap();
 
-        let report = Report::load(&store, Period::Daily, day).unwrap();
+        let report = Report::load(&store, Period::Daily, day, None).unwrap();
         assert_eq!(report.websites.len(), 1);
         let site = &report.websites[0];
         assert_eq!(site.domain, "example.com");

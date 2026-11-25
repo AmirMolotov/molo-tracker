@@ -2,6 +2,14 @@
 
 Molo is a Windows desktop app for reviewing your foreground app usage. Its interface and system tray use Anomaly’s Rune framework.
 
+## Install on Windows
+
+Download the x64 setup executable from [GitHub Releases](https://github.com/AmirMolotov/molo-tracker/releases/latest). Quit any running copy of Molo from the notification area before running Setup. Accept the [Terms of Use](installer/Terms.txt) and choose an install folder. Setup installs Molo for your Windows account and adds a Start menu shortcut.
+
+To uninstall, quit Molo from the notification area, then open **Settings → Apps → Installed apps** and choose **Uninstall** for **Molo Tracker**. Activity and settings remain in `%LOCALAPPDATA%\Molo Tracker`.
+
+To build setup from source, install [Inno Setup 6](https://jrsoftware.org/inno-setup/downloads) and run `.\installer\build.ps1` with the Windows x64 MSVC Rust toolchain. The installer is written to `target\installer`.
+
 ## Run
 
 Use stable Rust with the Windows MSVC target and the Visual Studio C++ build tools.
@@ -27,6 +35,8 @@ In **Settings**, **Timetable cutoff** starts at 5 seconds. Shorter sessions rema
 In **Settings → App aliases and groups**, create a group such as **Games**. Ctrl-click to add or remove individual apps from the selection. Shift-click selects the range from your last selection anchor. Drag a selected app onto a group to move the whole selection, or enter a group name and choose **Move to group**. Drop apps on **Ungrouped** to remove their grouping. Each app can belong to one group, and reports apply current group membership to existing activity.
 
 **Reports** shows focus time and session counts for apps and groups, with changes from the previous period. Choose **Daily**, **Weekly**, or **Monthly** and use the date controls to browse earlier periods. Weeks start on Monday. Ongoing periods show activity recorded so far compared with the full previous period. A focus session starts when Molo begins tracking a foreground app, including after switching back to an open app.
+
+When activity from another PC is available, choose a PC under **Device** to filter the charts, website report, and previous-period comparison. Choose **All devices** to return to the combined report.
 
 **Reports → Websites** groups recorded Chrome and Firefox focus time by main domain. Subdomains such as `news.bbc.co.uk` are combined under `bbc.co.uk`. The report lists each browser’s time, the combined total, and the change from the previous period. Molo reads the current browser address through Windows accessibility and saves only the domain for this report. This starts with new activity, and browser time still counts in the app and group reports when a domain cannot be read.
 

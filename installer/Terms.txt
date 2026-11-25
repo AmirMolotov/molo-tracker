@@ -1,0 +1,15 @@
+Molo Tracker Terms of Use
+
+By accepting these terms, you agree to them when installing and using Molo Tracker.
+
+Use Molo Tracker only on devices and accounts you are authorized to monitor. You are responsible for obtaining any permission required from people whose activity may be recorded.
+
+While tracking is active, Molo records the foreground app, executable path, and session times. It can also record the active tab title and website domain in Chrome and Firefox. It uses the time since the last keyboard or mouse input to detect inactivity. You can pause tracking in the app or quit from the notification area.
+
+Molo stores activity and settings in your Windows profile. If you use Account sync, your configured sync server handles your account sign-in and receives your device name, app names and session times, recorded tab titles and website domains, and shared settings such as app aliases and groups. A device connected to the same sync account can download that history. Keep your account credentials secure and use a sync server you trust.
+
+Uninstalling removes the program and its shortcuts. Your local activity and settings remain in %LOCALAPPDATA%\Molo Tracker. Uninstalling does not delete data already stored on the sync server.
+
+Molo Tracker is provided as is. To the extent permitted by applicable law, no warranty is made about the accuracy, availability, or completeness of tracking and sync. These terms do not limit rights you have under applicable law that cannot be waived.
+
+Project and support: https://github.com/AmirMolotov/molo-tracker

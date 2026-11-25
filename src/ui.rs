@@ -79,6 +79,7 @@ fn button(
         .focus_ring(2.0, 2.0, color(FOREST))
         .center()
         .h(44.0)
+        .min_w(0.0)
         .px(13.0)
         .radius(9.0)
         .border(1.0, if selected { color(FOREST) } else { color(LINE) })
@@ -87,11 +88,16 @@ fn button(
         } else {
             color(SURFACE)
         })
-        .child(label(
-            name,
-            BODY,
-            if selected { color(PAPER) } else { color(MUTED) },
-        ));
+        .child(
+            label(
+                name,
+                BODY,
+                if selected { color(PAPER) } else { color(MUTED) },
+            )
+            .min_w(0.0)
+            .truncate()
+            .help_when_truncated(name),
+        );
     if !disabled {
         node = node
             .hover(if selected {
@@ -1013,6 +1019,42 @@ fn drag_ghost(s: &State, viewport: [f32; 2]) -> Option<El> {
     )
 }
 
+fn checkbox_row(key: impl Into<String>, name: &str, checked: bool) -> El {
+    let mut checkbox = el()
+        .size(18.0, 18.0)
+        .radius(4.0)
+        .border(1.0, color(if checked { FOREST } else { MUTED }))
+        .fill(color(if checked { FOREST } else { SURFACE }));
+    if checked {
+        checkbox = checkbox.shape(
+            rune::Shape::new()
+                .stroke(vec![[4.0, 9.0], [7.5, 12.5], [14.0, 5.5]], 1.8, color(LIME))
+                .view_box(18.0, 18.0),
+        );
+    }
+    row()
+        .key(key)
+        .role("checkbox")
+        .label(name)
+        .checked(checked)
+        .focusable(true)
+        .focus_ring(2.0, -2.0, color(FOREST))
+        .min_h(44.0)
+        .px(9.0)
+        .gap(9.0)
+        .center_y()
+        .radius(8.0)
+        .fill(color(if checked { 0xddebd6 } else { SURFACE }))
+        .hover(color(BASE))
+        .child(checkbox)
+        .child(
+            label(name, BODY, color(INK))
+                .min_w(0.0)
+                .truncate()
+                .help_when_truncated(name),
+        )
+}
+
 fn idle_exception_picker(s: &State) -> El {
     let query = search_query(&s.idle_exception_search);
     let mut matches = s.apps.iter().filter(|app| app.matches(&query)).peekable();
@@ -1039,40 +1081,9 @@ fn idle_exception_picker(s: &State) -> El {
     for app in matches {
         let id = app.id.clone();
         let enabled = s.idle_exceptions.contains(&id.key);
-        let mut checkbox = el()
-            .size(18.0, 18.0)
-            .radius(4.0)
-            .border(1.0, color(if enabled { FOREST } else { MUTED }))
-            .fill(color(if enabled { FOREST } else { SURFACE }));
-        if enabled {
-            let mark = rune::Shape::new()
-                .stroke(vec![[4.0, 9.0], [7.5, 12.5], [14.0, 5.5]], 1.8, color(LIME))
-                .view_box(18.0, 18.0);
-            checkbox = checkbox.shape(mark);
-        }
         choices = choices.child(
-            row()
-                .key(format!("idle-exception:{}", id.key))
-                .role("checkbox")
-                .label(app.label())
-                .checked(enabled)
-                .focusable(true)
-                .focus_ring(2.0, -2.0, color(FOREST))
-                .min_h(44.0)
-                .px(9.0)
-                .gap(9.0)
-                .center_y()
-                .radius(8.0)
-                .fill(color(if enabled { 0xddebd6 } else { SURFACE }))
-                .hover(color(BASE))
-                .on_press(move |s: &mut State| s.toggle_idle_exception(&id))
-                .child(checkbox)
-                .child(
-                    label(app.label(), BODY, color(INK))
-                        .min_w(0.0)
-                        .truncate()
-                        .help_when_truncated(app.label()),
-                ),
+            checkbox_row(format!("idle-exception:{}", id.key), app.label(), enabled)
+                .on_press(move |s: &mut State| s.toggle_idle_exception(&id)),
         );
     }
     picker = picker.child(
@@ -1170,6 +1181,20 @@ fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
             .max_w(SETTINGS_WIDTH)
             .gap(16.0)
             .child(heading("Settings", 1))
+            .child(
+                panel()
+                    .key("startup-settings")
+                    .child(heading("Startup", 2))
+                    .child(
+                        checkbox_row(
+                            "start-with-windows",
+                            "Start with Windows",
+                            s.start_with_windows,
+                        )
+                        .on_press(State::toggle_start_with_windows),
+                    )
+                    .children(s.startup_error.as_deref().map(empty_message)),
+            )
             .children(sync_settings(s))
             .child(idle)
             .child(cutoff)
@@ -1179,6 +1204,7 @@ fn settings(s: &State, compact: bool, cx: &Cx<State>) -> El {
 
 fn settings_navigation(s: &State, cx: &Cx<State>, compact: bool, inset: f32) -> El {
     let sections: Vec<_> = [
+        ("settings-startup", "Startup", "startup-settings"),
         ("settings-account", "Account", "sync-settings"),
         ("settings-idle", "Idle detection", "idle-settings"),
         ("settings-timetable", "Timetable", "cutoff"),

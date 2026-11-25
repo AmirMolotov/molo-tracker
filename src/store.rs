@@ -60,6 +60,17 @@ pub struct Device {
 }
 
 impl Device {
+    fn remote(id: String, name: Option<String>) -> Self {
+        let name = name
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("Device {}", id.chars().take(8).collect::<String>()));
+        Self {
+            id,
+            name,
+            local: false,
+        }
+    }
+
     pub fn label(&self) -> String {
         if self.local {
             format!("{} (this PC)", self.name)
@@ -324,11 +335,12 @@ impl Store {
         &self,
         start: NaiveDate,
         end: NaiveDate,
+        device: Option<&str>,
     ) -> rusqlite::Result<Vec<(Application, Usage)>> {
         let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
             return Ok(Vec::new());
         };
-        let sessions = self.range(start, end)?;
+        let sessions = self.range(start, end, device)?;
         let mut apps = BTreeMap::new();
         let mut counted = BTreeSet::new();
         for part in covered(&sessions) {
@@ -348,7 +360,29 @@ impl Store {
         let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
             return Ok(Vec::new());
         };
-        Ok(coverage::device_usage(&self.range(start, end)?))
+        Ok(coverage::device_usage(&self.range(start, end, None)?))
+    }
+
+    pub fn report_devices(&self) -> rusqlite::Result<Vec<Device>> {
+        let id = self
+            .0
+            .query_row("SELECT device FROM sync_profile WHERE id=1", [], |row| {
+                row.get(0)
+            })?;
+        let mut devices = vec![Device {
+            id,
+            name: local_device_name(),
+            local: true,
+        }];
+        let mut query = self.0.prepare(
+            "SELECT DISTINCT sync_import.device, sync_devices.name
+             FROM sync_import LEFT JOIN sync_devices ON sync_devices.id = sync_import.device
+             ORDER BY sync_devices.name COLLATE NOCASE, sync_import.device",
+        )?;
+        for device in query.query_map([], |row| Ok(Device::remote(row.get(0)?, row.get(1)?)))? {
+            devices.push(device?);
+        }
+        Ok(devices)
     }
 
     pub fn record(
@@ -416,11 +450,12 @@ impl Store {
         &self,
         start: NaiveDate,
         end: NaiveDate,
+        device: Option<&str>,
     ) -> rusqlite::Result<Vec<WebsiteTime>> {
         let (Some(start), Some(end)) = (day_start(start), day_start(end)) else {
             return Ok(Vec::new());
         };
-        let sessions = self.range(start, end)?;
+        let sessions = self.range(start, end, device)?;
         let mut intervals = BTreeMap::<i64, Vec<(i64, i64)>>::new();
         for part in covered(&sessions) {
             intervals
@@ -523,10 +558,10 @@ impl Store {
         let Some((start, end)) = day_bounds(date) else {
             return Ok(Vec::new());
         };
-        self.range(start, end)
+        self.range(start, end, None)
     }
 
-    fn range(&self, start: i64, end: i64) -> rusqlite::Result<Vec<Session>> {
+    fn range(&self, start: i64, end: i64, device: Option<&str>) -> rusqlite::Result<Vec<Session>> {
         let local = local_device_name();
         let mut query = self.0.prepare(
             "SELECT apps.path, apps.name, apps.alias, app_groups.name, MAX(sessions.start, ?1), MIN(sessions.end, ?2),
@@ -538,22 +573,14 @@ impl Store {
              LEFT JOIN sync_import ON sync_import.session = sessions.id
              LEFT JOIN sync_devices ON sync_devices.id = sync_import.device
              WHERE sessions.end > ?1 AND sessions.start < ?2
+               AND (?3 IS NULL OR COALESCE(sync_import.device, sync_profile.device) = ?3)
              ORDER BY sessions.start DESC, sessions.id DESC",
         )?;
         query
-            .query_map(params![start, end], |row| {
+            .query_map(params![start, end, device], |row| {
                 let remote: Option<String> = row.get(9)?;
                 let device = match remote {
-                    Some(id) => Device {
-                        name: row
-                            .get::<_, Option<String>>(11)?
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or_else(|| {
-                                format!("Device {}", id.chars().take(8).collect::<String>())
-                            }),
-                        id,
-                        local: false,
-                    },
+                    Some(id) => Device::remote(id, row.get(11)?),
                     None => Device {
                         id: row.get(12)?,
                         name: local.clone(),
@@ -658,7 +685,7 @@ mod tests {
         assert!(store.change_folder("work", Some("Projects")).unwrap());
         assert!(store.change_folder("écriture", None).unwrap());
         assert_eq!(store.group_folders().unwrap(), ["Projects"]);
-        let sessions = store.range(1000, 2000).unwrap();
+        let sessions = store.range(1000, 2000, None).unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].app.group.is_none());
     }
@@ -691,7 +718,7 @@ mod tests {
         );
         store.record(&app, 4000, 5000, None, None, None).unwrap();
         store.save_alias(&app, " Writing ").unwrap();
-        let sessions = store.range(1500, 4500).unwrap();
+        let sessions = store.range(1500, 4500, None).unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!((sessions[0].start, sessions[0].end), (4000, 4500));
         assert_eq!((sessions[1].start, sessions[1].end), (1500, 3000));
@@ -699,7 +726,10 @@ mod tests {
         assert!(sessions[1].meets_cutoff(2));
         assert!(!sessions[1].meets_cutoff(3));
         store.save_alias(&app, "").unwrap();
-        assert_eq!(store.range(1500, 4500).unwrap()[1].app.label(), "editor");
+        assert_eq!(
+            store.range(1500, 4500, None).unwrap()[1].app.label(),
+            "editor"
+        );
     }
 
     #[test]
@@ -718,7 +748,7 @@ mod tests {
         store
             .record(&chrome, 3000, 4000, Some(id), Some("Second page"), None)
             .unwrap();
-        let sessions = store.range(1500, 3500).unwrap();
+        let sessions = store.range(1500, 3500, None).unwrap();
         assert_eq!(sessions.len(), 1);
         let pages = store.pages(&sessions[0]).unwrap();
         assert_eq!(
@@ -732,6 +762,6 @@ mod tests {
         store.save_cutoff(8).unwrap();
         assert_eq!(store.cutoff().unwrap(), 8);
         assert!(!sessions[0].meets_cutoff(store.cutoff().unwrap()));
-        assert_eq!(store.range(1500, 3500).unwrap().len(), 1);
+        assert_eq!(store.range(1500, 3500, None).unwrap().len(), 1);
     }
 }

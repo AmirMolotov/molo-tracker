@@ -1,13 +1,18 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE,
+    HWND, LPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+};
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -17,6 +22,65 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowLongW,
     GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW,
 };
+use windows_sys::{core::PCWSTR, w};
+
+const STARTUP_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
+const STARTUP_VALUE: PCWSTR = w!("Molo Tracker");
+
+pub fn starts_with_windows() -> io::Result<bool> {
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            STARTUP_KEY,
+            STARTUP_VALUE,
+            RRF_RT_REG_SZ,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+        )
+    };
+    match status {
+        ERROR_SUCCESS => Ok(true),
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        error => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
+pub fn set_start_with_windows(enabled: bool) -> io::Result<()> {
+    if !enabled {
+        return match unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, STARTUP_KEY, STARTUP_VALUE) } {
+            ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+            error => Err(io::Error::from_raw_os_error(error as i32)),
+        };
+    }
+
+    let exe = std::env::current_exe()?;
+    let command: Vec<u16> = [u16::from(b'"')]
+        .into_iter()
+        .chain(exe.as_os_str().encode_wide())
+        .chain([u16::from(b'"'), 0])
+        .collect();
+    if command.len() > 261 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The app path is too long for Windows startup.",
+        ));
+    }
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            STARTUP_KEY,
+            STARTUP_VALUE,
+            REG_SZ,
+            command.as_ptr().cast(),
+            std::mem::size_of_val(command.as_slice()) as u32,
+        )
+    };
+    match status {
+        ERROR_SUCCESS => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppId {

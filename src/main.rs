@@ -20,7 +20,7 @@ use report::{Period, Report};
 use rune::{
     App, AppSpec, Image, ImageCache, TextEdit, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec, Tx,
 };
-use store::{Application, BrowserPage, DEFAULT_IDLE_SECONDS, Session, Store};
+use store::{Application, BrowserPage, DEFAULT_IDLE_SECONDS, Device, Session, Store};
 use websites::WebsiteProbe;
 
 struct Sample {
@@ -118,6 +118,8 @@ struct State {
     sync: Option<sync::Client>,
     sync_error: Option<String>,
     live: bool,
+    start_with_windows: bool,
+    startup_error: Option<String>,
     paused: bool,
     idle: bool,
     idle_seconds: u32,
@@ -167,6 +169,8 @@ struct State {
     report_period: Period,
     report_date: NaiveDate,
     report: Report,
+    report_device: Option<String>,
+    report_devices: Vec<Device>,
     report_group: Option<String>,
     report_websites: bool,
     report_app_search: TextEdit,
@@ -201,6 +205,8 @@ impl State {
             sync: None,
             sync_error: None,
             live,
+            start_with_windows: false,
+            startup_error: None,
             today,
             day: today,
             first: today,
@@ -254,6 +260,8 @@ impl State {
             report_period: Period::Daily,
             report_date: today,
             report: Report::default(),
+            report_device: None,
+            report_devices: Vec::new(),
             report_group: None,
             report_websites: false,
             report_app_search: TextEdit::new(""),
@@ -367,6 +375,17 @@ impl State {
             Screen::Settings => {
                 if self.live {
                     self.open_apps = platform::open_apps();
+                    match platform::starts_with_windows() {
+                        Ok(enabled) => {
+                            self.start_with_windows = enabled;
+                            self.startup_error = None;
+                        }
+                        Err(error) => {
+                            self.startup_error = Some(format!(
+                                "Could not read the Windows startup setting. {error}"
+                            ));
+                        }
+                    }
                 }
                 self.refresh_apps();
             }
@@ -374,8 +393,29 @@ impl State {
     }
 
     fn refresh_report(&mut self) {
-        match Report::load(&self.store, self.report_period, self.report_date) {
-            Ok(report) => self.report = report,
+        self.load_report(self.report_device.clone());
+    }
+
+    fn load_report(&mut self, device: Option<String>) {
+        let result = self.store.report_devices().and_then(|devices| {
+            let device = device.filter(|id| devices.iter().any(|device| &device.id == id));
+            let report = Report::load(
+                &self.store,
+                self.report_period,
+                self.report_date,
+                device.as_deref(),
+            )?;
+            Ok((report, devices, device))
+        });
+        match result {
+            Ok((report, devices, device)) => {
+                if self.report_device != device {
+                    self.report_group = None;
+                }
+                self.report = report;
+                self.report_devices = devices;
+                self.report_device = device;
+            }
             Err(error) => self.notice = Some(format!("Could not read the report. {error}")),
         }
     }
@@ -492,6 +532,20 @@ impl State {
             }
             Err(error) => self.notice = Some(format!("Could not read folders. {error}")),
         }
+    }
+
+    fn toggle_start_with_windows(&mut self) {
+        let enabled = !self.start_with_windows;
+        if self.live
+            && let Err(error) = platform::set_start_with_windows(enabled)
+        {
+            self.startup_error = Some(format!(
+                "Could not change the Windows startup setting. {error}"
+            ));
+            return;
+        }
+        self.start_with_windows = enabled;
+        self.startup_error = None;
     }
 
     fn toggle_idle_exception(&mut self, app: &AppId) {

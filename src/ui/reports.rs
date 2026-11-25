@@ -131,6 +131,7 @@ pub(super) fn view(s: &State, compact: bool) -> El {
                 .child(label(baseline, BODY, color(MUTED)).wrap()),
         )
         .child(controls)
+        .children((s.report_devices.len() > 1).then(|| device_filter(s)))
         .child(report_views);
     if s.report_websites {
         report.child(websites(s, compact))
@@ -141,6 +142,41 @@ pub(super) fn view(s: &State, compact: bool) -> El {
             .child(groups(s, compact))
             .child(apps(s, compact))
     }
+}
+
+fn device_filter(s: &State) -> El {
+    col()
+        .gap(6.0)
+        .child(label("Device", BODY, color(MUTED)))
+        .child(
+            row()
+                .gap(6.0)
+                .flex_wrap()
+                .role("group")
+                .label("Report device")
+                .child(
+                    button(
+                        "report-all-devices",
+                        "All devices",
+                        s.report_device.is_none(),
+                        false,
+                        |s, _| {
+                            s.load_report(None);
+                        },
+                    )
+                    .checked(s.report_device.is_none()),
+                )
+                .children(s.report_devices.iter().map(|device| {
+                    let id = device.id.clone();
+                    let key = format!("report-filter-device:{id}");
+                    let selected = s.report_device.as_ref() == Some(&id);
+                    button(&key, &device.label(), selected, false, move |s, _| {
+                        s.load_report(Some(id.clone()));
+                    })
+                    .max_w(300.0)
+                    .checked(selected)
+                })),
+        )
 }
 
 fn device_breakdown(s: &State) -> Option<El> {
